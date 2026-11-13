@@ -1,0 +1,16 @@
+#!/bin/sh
+# Purge removes the tool's own configuration, backups and logs. HAProxy, haproxy.cfg, /etc/haproxy/certs and
+# certbot certificates are never touched.
+set -e
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    find /opt/haproxy-admin -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true
+    rmdir --ignore-fail-on-non-empty /opt/haproxy-admin/bin /opt/haproxy-admin 2>/dev/null || true
+    [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+if [ "$1" = "purge" ]; then
+    rm -rf /etc/haproxy-admin /var/lib/haproxy-admin /var/log/haproxy-admin
+    if getent passwd haproxy-admin >/dev/null; then
+        deluser --system haproxy-admin >/dev/null 2>&1 || true
+    fi
+fi
+exit 0

@@ -1,0 +1,48 @@
+#!/bin/sh
+# haproxy-admin postinst: service user, configuration (never overwritten), state directories, service.
+set -e
+
+ETC=/etc/haproxy-admin
+SHARE=/usr/share/haproxy-admin
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd haproxy-admin >/dev/null; then
+        adduser --system --group --no-create-home --home /nonexistent --shell /usr/sbin/nologin haproxy-admin
+    fi
+    if getent group haproxy >/dev/null; then
+        usermod -aG haproxy haproxy-admin
+    fi
+
+    install -d -o root -g haproxy-admin -m 0750 "$ETC" "$ETC/tls"
+    [ -f "$ETC/admin.conf" ] || install -o root -g haproxy-admin -m 0640 "$SHARE/admin.conf.example" "$ETC/admin.conf"
+    [ -f "$ETC/service.env" ] || install -o root -g root -m 0644 "$SHARE/service.env.example" "$ETC/service.env"
+    if [ ! -f "$ETC/secret_key" ]; then
+        head -c 48 /dev/urandom | base64 -w0 > "$ETC/secret_key"
+        chown root:haproxy-admin "$ETC/secret_key"
+        chmod 0640 "$ETC/secret_key"
+    fi
+    if [ ! -f "$ETC/tls/cert.pem" ]; then
+        fqdn="$(hostname -f 2>/dev/null || hostname)"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -noenc -days 30 \
+            -subj "/CN=$fqdn" -addext "subjectAltName=DNS:$fqdn" \
+            -keyout "$ETC/tls/key.pem" -out "$ETC/tls/cert.pem" 2>/dev/null
+        chown root:haproxy-admin "$ETC/tls/key.pem" "$ETC/tls/cert.pem"
+        chmod 0640 "$ETC/tls/key.pem" "$ETC/tls/cert.pem"
+        echo "haproxy-admin: created a temporary self-signed certificate (30 days) - replace it, see README."
+    fi
+
+    install -d -o root -g root -m 0700 /var/lib/haproxy-admin /var/lib/haproxy-admin/backups /var/lib/haproxy-admin/tmp
+    install -d -o haproxy-admin -g haproxy-admin -m 0750 /var/log/haproxy-admin
+    install -d -o root -g root -m 0700 /etc/haproxy/certs
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload || true
+        if [ -z "$2" ]; then
+            systemctl enable haproxy-admin >/dev/null 2>&1 || true
+            echo "haproxy-admin: edit $ETC/admin.conf (Entra tenant/client) and $ETC/service.env, then: systemctl restart haproxy-admin"
+        fi
+        systemctl restart haproxy-admin || echo "haproxy-admin: service not started yet - check: journalctl -u haproxy-admin"
+    fi
+fi
+
+exit 0

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Apply result{% endblock %}
+{% block content %}
+<h1>{{ reason }}</h1>
+{% if result.ok %}
+  <div class="flash ok">{% if result.changed %}Applied and HAProxy reloaded. Backup of the previous file: <code>{{ result.backup }}</code>{% else %}No changes.{% endif %}</div>
+{% else %}
+  <div class="flash error">Not applied (stage: {{ result.stage }}).{% if result.rolled_back %} The previous configuration was restored{% if not result.rollback_ok %} – BUT the rollback reload also failed, check the server!{% endif %}.{% endif %}</div>
+{% endif %}
+<section class="card"><h2>Output</h2><pre class="code small">{{ result.output }}</pre>
+{% if result.rollback_output %}<h3>Rollback</h3><pre class="code small">{{ result.rollback_output }}</pre>{% endif %}
+</section>
+<div class="row">
+  <a class="btn" href="{{ url_for('main.dashboard') }}">Dashboard</a>
+  {% if not result.ok %}<a class="btn" href="{{ url_for('main.preview', cid=cid) }}">Back to preview</a>{% endif %}
+</div>
+{% endblock %}

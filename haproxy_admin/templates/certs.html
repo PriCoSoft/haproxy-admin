@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Certificates{% endblock %}
+{% macro daysbadge(c) -%}
+  {% if c and c.days_left is defined and c.days_left is not none %}<span class="badge {{ 'bad' if c.days_left < 14 else 'warn' if c.days_left < 30 else 'good' }}">{{ c.days_left }} days</span>{% else %}–{% endif %}
+{%- endmacro %}
+{% macro act(name, action, label, cls='', confirm=None, title='') -%}
+<form method="post" action="{{ url_for('main.cert_action', name=name, action=action) }}" {% if confirm %}data-confirm="{{ confirm }}"{% endif %}>
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}"><button class="btn small {{ cls }}" title="{{ title }}">{{ label }}</button></form>
+{%- endmacro %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>Certificates</h1><p class="sub">Let's Encrypt certificates managed by certbot on this proxy.</p></div>
+  <div class="row"><a class="btn" href="{{ url_for('main.cert_dns') }}">DNS providers</a>
+  <a class="btn primary" href="{{ url_for('main.cert_new_form') }}">+ Request certificate</a></div>
+</div>
+{% if err %}<div class="flash error">Helper: {{ err }}</div>{% endif %}
+{% if rt_error %}<div class="flash error">{{ rt_error }}</div>{% endif %}
+
+<div class="certgrid">
+  {% for l in lineages %}
+  {% set c = l.cert %}
+  <div class="certcard {{ 'staging' if l.staging }}">
+    <div class="ch">
+      <div><h3>{{ l.name }}</h3>
+        <div class="tags">
+          {% if l.staging %}<span class="badge warn">staging / test</span>{% endif %}
+          {% if l.in_haproxy %}<span class="badge good">active in HAProxy</span>{% elif l.deployed or l.legacy %}<span class="badge">deployed, not loaded</span>{% else %}<span class="badge">not deployed</span>{% endif %}
+          {% if l.managed %}<span class="badge good" title="renewals are deployed to HAProxy automatically">auto-deploy</span>{% endif %}
+        </div>
+      </div>
+      {{ daysbadge(c) }}
+    </div>
+    <div class="domains">{% for d in c.sans or [] %}<span class="host">{{ d }}</span>{% endfor %}</div>
+    <dl>
+      <dt>Expires</dt><dd>{{ (c.not_after or '')[:10] }}</dd>
+      <dt>Validation</dt><dd>{{ 'DNS-01' if 'dns' in l.challenge else 'HTTP-01' if 'http' in l.challenge else l.authenticator }}
+        {% if l.dns_hook == 'builtin' %}<span class="badge good" title="DNS providers configured in this tool">built-in DNS hook</span>{% elif l.dns_hook == 'legacy' %}<span class="badge warn" title="external hook script">external hook</span>{% endif %}</dd>
+      <dt>Key</dt><dd>{{ c.key_type }} · {{ c.issuer }}</dd>
+      {% if l.deployed %}<dt>HAProxy file</dt><dd class="mono small">{{ l.deployed.path }}</dd>{% endif %}
+      {% if l.legacy %}<dt>Legacy file</dt><dd class="mono small">{{ l.legacy.path }} {% if l.legacy.mode[-1] in '4567' %}<span class="badge bad" title="private key readable by all users">{{ l.legacy.mode[2:] }}</span>{% endif %}</dd>{% endif %}
+    </dl>
+    <div class="cardactions">
+      {% if l.dns_hook == 'legacy' %}{{ act(l.name, 'dns-switch', 'Switch to built-in DNS hook', 'primary', confirm="Switch " ~ l.name ~ " to the configured DNS providers? A test renewal (Let's Encrypt staging) runs first; on failure the old settings are restored.", title='Use the DNS providers of this tool for renewals (+ auto-deploy)') }}
+      {% elif not l.staging and not l.managed %}{{ act(l.name, 'auto-deploy', 'Enable auto-deploy', 'primary', confirm="Run a test renewal (Let's Encrypt staging) and, if it succeeds, deploy renewals of " ~ l.name ~ " to HAProxy automatically?", title='certbot reconfigure: test renewal, then store the deploy hook; deploys the current certificate once') }}{% endif %}
+      {% if not l.staging %}{{ act(l.name, 'deploy', 'Deploy to HAProxy', title='Write ' ~ l.name ~ '.pem to the HAProxy certificate directory and update the running HAProxy') }}{% endif %}
+      {{ act(l.name, 'renew', 'Renew if due', title='certbot renews only within 30 days of expiry') }}
+      <details class="more"><summary class="btn small">…</summary>
+        <div class="menu">
+          {{ act(l.name, 'force-renew', 'Force renewal now', confirm="Force renewal now? Let's Encrypt allows only 5 identical certificates per week.") }}
+          {% if l.staging %}
+          <form method="post" action="{{ url_for('main.cert_action', name=l.name, action='delete') }}" data-confirm-name="{{ l.name }}"><input type="hidden" name="_csrf" value="{{ csrf_token() }}"><input type="hidden" name="confirm" value=""><button class="btn small danger">Delete</button></form>
+          {% endif %}
+        </div>
+      </details>
+    </div>
+  </div>
+  {% else %}
+  <p class="muted">No certbot certificates found.</p>
+  {% endfor %}
+</div>
+
+{% if jobs %}
+<section class="card">
+  <h2>Recent certificate jobs</h2>
+  <ul class="list">
+    {% for j in jobs %}
+    <li><span class="dot {{ 'warn' if j.running else 'good' if j.rc == 0 else 'bad' }}"></span>
+      <div><a href="{{ url_for('main.job', job_id=j.id) }}">{{ j.title }}</a><div class="muted small">{{ j.started|ts }} · {{ j.user }}</div></div>
+      <span class="badge {{ 'warn' if j.running else 'good' if j.rc == 0 else 'bad' }}">{{ 'running' if j.running else 'ok' if j.rc == 0 else 'failed' }}</span></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<details class="card">
+  <summary><h2 class="inline">Certificates loaded in HAProxy</h2> <span class="hint">{{ loaded|length }} files</span></summary>
+  <table>
+    <tr><th>File</th><th>Names</th><th>Expires</th></tr>
+    {% for c in loaded %}<tr><td class="mono small">{{ c.path }}</td><td class="small">{{ c.sans|join(', ') }}</td><td>{{ daysbadge(c) }}</td></tr>{% endfor %}
+  </table>
+</details>
+
+<details class="card">
+  <summary><h2 class="inline">Certificate list for TLS binds (crt-list)</h2>
+    {% if crt_list_active %}<span class="badge good">in use</span>{% else %}<span class="badge">not in use yet</span>{% endif %}</summary>
+  <p class="hint">File <code>{{ crt_list_path }}</code>. HAProxy picks the matching certificate per host name (SNI); the default is used for clients without SNI.
+    {% if crt_list_active %}Saving validates and reloads HAProxy (rolled back on error).{% else %}Saving only writes the file until the TLS bind lines reference it (see Dashboard → setup steps).{% endif %}</p>
+  {% if deployed %}
+  <form method="post" action="{{ url_for('main.crt_list_save') }}" data-confirm="Save crt-list{{ ' and reload HAProxy' if crt_list_active }}?">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <table>
+      <tr><th>Use</th><th>Default</th><th>Certificate file</th></tr>
+      {% for n in deployed %}
+      {% set path = (data.cert_dir ~ '/' ~ n ~ '.pem') %}
+      <tr><td><input type="checkbox" name="active" value="{{ n }}" {{ 'checked' if crt_list and path in crt_list }}></td>
+        <td><input type="radio" name="default" value="{{ n }}" {{ 'checked' if crt_list and crt_list[0] == path }}></td>
+        <td class="mono small">{{ path }}</td></tr>
+      {% endfor %}
+    </table>
+    <button class="btn">Save crt-list</button>
+  </form>
+  {% else %}<p class="muted">Deploy at least one certificate first ("Deploy to HAProxy").</p>{% endif %}
+</details>
+{% endblock %}

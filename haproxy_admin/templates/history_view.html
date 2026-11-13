@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Backup {{ bid }}{% endblock %}
+{% block content %}
+<div class="head">
+  <h1>Backup <span class="mono">{{ bid }}</span></h1>
+  <form method="post" action="{{ url_for('main.history_restore', bid=bid) }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <button class="btn">Restore (preview)</button>
+  </form>
+</div>
+<section class="card">
+  <h2>Difference to current configuration</h2>
+  {% if diff %}<pre class="diff">{% for kind, line in diff %}<span class="{{ kind }}">{{ line }}</span>
+{% endfor %}</pre>{% else %}<p class="muted">Identical to current configuration.</p>{% endif %}
+</section>
+<section class="card"><h2>Content</h2><pre class="code small">{{ text }}</pre></section>
+{% endblock %}

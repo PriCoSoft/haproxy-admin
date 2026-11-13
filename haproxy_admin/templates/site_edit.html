@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% block title %}{{ 'New site' if new else site.name }}{% endblock %}
+{% macro condrow(i, j, c) -%}
+<div class="cond">
+  <select name="r{{ i }}_c{{ j }}_type">
+    {% for k, v in COND_TYPES.items() %}<option value="{{ k }}" {{ 'selected' if c and c.type == k }} data-hint="{{ v[2] }}">{{ v[0] }}</option>{% endfor %}
+  </select>
+  <input name="r{{ i }}_c{{ j }}_val" value="{{ c.value if c }}" class="mono" placeholder="{{ COND_TYPES[c.type][2] if c else '/api/' }}">
+  <label class="chk" title="negate: the condition must NOT match"><input type="checkbox" name="r{{ i }}_c{{ j }}_neg" value="1" {{ 'checked' if c and c.neg }}>not</label>
+  <button type="button" class="link small" data-remove=".cond" title="remove condition">✕</button>
+</div>
+{%- endmacro %}
+{% macro routerow(i, r) -%}
+<tr class="route" data-index="{{ i }}">
+  <td><input name="r{{ i }}_host" value="{{ r.host if r }}" class="mono" placeholder="app.example.com" {% if new and i == 0 %}data-suggest="#sitename"{% endif %}></td>
+  <td>
+    <div class="conds">{% for c in (r.conds if r else []) %}{{ condrow(i, loop.index0, c) }}{% endfor %}</div>
+    <button type="button" class="link small" data-addcond>+ condition</button>
+  </td>
+  <td>{% if r and r.host in certs %}{% set c = certs[r.host] %}{% if c == '-' %}<span class="muted small" title="pattern – certificate not checked">pattern</span>{% elif c %}<span class="badge good" title="{{ c.path }}">{{ c.days_left }} d</span>{% else %}<a class="badge warn" href="{{ url_for('main.cert_new_form', domains=r.host) }}">no cert</a>{% endif %}{% endif %}</td>
+  <td class="ctr"><input type="checkbox" name="r{{ i }}_del" value="1" title="remove this host"></td>
+</tr>
+{%- endmacro %}
+{% macro srvrow(i, s) -%}
+<tr>
+  <td><input name="s{{ i }}_name" value="{{ s.name if s }}" placeholder="web05"></td>
+  <td><input name="s{{ i }}_addr" value="{{ s.address if s }}" class="mono" placeholder="10.0.1.55:443"></td>
+  <td class="ctr"><input type="checkbox" name="s{{ i }}_tls" value="1" {{ 'checked' if (s.tls if s else true) }}></td>
+  <td class="ctr"><input type="checkbox" name="s{{ i }}_verify" value="1" {{ 'checked' if s and s.verify }} title="verify the server certificate against the system CA store"></td>
+  <td class="ctr"><input type="checkbox" name="s{{ i }}_check" value="1" {{ 'checked' if (s.check if s else true) }}></td>
+  <td><input name="s{{ i }}_opts" value="{{ s.options if s }}" class="mono" placeholder="maxconn 1000 inter 30s"></td>
+  <td>{% if s and status.get(s.name) %}{% set stt = status[s.name] %}<span class="badge {{ 'good' if stt.startswith('UP') else '' if stt in ('no check', '') else 'bad' }}">{{ stt }}</span>{% endif %}</td>
+</tr>
+{%- endmacro %}
+{% macro rdrow(i, r) -%}
+<tr>
+  <td><select name="rd{{ i }}_match"><option value="exact" {{ 'selected' if r and r.match == 'exact' }}>is</option><option value="prefix" {{ 'selected' if r and r.match == 'prefix' }}>begins with</option></select></td>
+  <td><input name="rd{{ i }}_path" value="{{ r.path if r }}" class="mono" placeholder="/"></td>
+  <td><input name="rd{{ i }}_to" value="{{ r.to if r }}" class="mono" placeholder="https://www.example.com"></td>
+  <td><select name="rd{{ i }}_code">{% for code in (302, 301, 307, 308) %}<option {{ 'selected' if r and r.code == code }}>{{ code }}</option>{% endfor %}</select></td>
+</tr>
+{%- endmacro %}
+{% block content %}
+<div class="pagehead">
+  <div>
+    <a class="back" href="{{ url_for('main.sites') }}">‹ Sites</a>
+    <h1>{{ 'New ' ~ ('redirect' if site.type == 'redirect' else 'site') if new else (site.description or site.name) }}</h1>
+    {% if not new %}<p class="sub"><span class="mono">{{ site.name }}</span> {% if not site.enabled %}<span class="badge warn">disabled</span>{% endif %}</p>{% endif %}
+  </div>
+  {% if not new %}
+  <div class="row">
+    <form method="post" action="{{ url_for('main.site_toggle', name=site.name) }}">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <button class="btn">{{ 'Enable' if not site.enabled else 'Disable' }}</button>
+    </form>
+    <form method="post" action="{{ url_for('main.site_delete', name=site.name) }}" data-confirm="Delete {{ site.name }}? You will see a preview first.">
+      <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+      <button class="btn danger-outline">Delete</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+{% if not st.managed %}<div class="flash error">The configuration is not managed yet – saving is possible after the <a href="{{ url_for('main.convert') }}">conversion</a>.</div>{% endif %}
+{% for e in errors %}<div class="flash error">{{ e }}</div>{% endfor %}
+
+<form method="post" class="form" id="siteform">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <input type="hidden" name="base_sha" value="{{ sha }}">
+  <input type="hidden" name="type" value="{{ site.type }}">
+
+  <section class="card">
+    <h2>General</h2>
+    <div class="grid2">
+      <label>Description
+        <input name="description" value="{{ site.description }}" placeholder="app.customer.example -> customer system XY" maxlength="200"></label>
+      <label>Name <span class="hint">backend name, shown in logs{{ ' · empty = generated from the first host' if new }}</span>
+        <input id="sitename" name="name" value="{{ site.name }}" class="mono" placeholder="EXAMPLE-CUSTOMER-APP"></label>
+    </div>
+    <label class="chk"><input type="checkbox" name="enabled" value="1" {{ 'checked' if site.enabled }}>Enabled <span class="hint">disabled sites stay saved but are not in the HAProxy configuration</span></label>
+  </section>
+
+  <section class="card">
+    <h2>Host names &amp; conditions</h2>
+    <p class="hint">A request goes to this site when its host name matches <em>and</em> all conditions of that row match.
+      <code>*.example.com</code> = all subdomains, <code>mta-sts.*</code> = wildcard anywhere. Several host names in one row (separated by spaces) share the conditions.
+      More specific rows (with conditions) are checked before plain host names.</p>
+    <table class="routes">
+      <thead><tr><th>Host name</th><th>Additional conditions</th><th>Certificate</th><th class="ctr">Remove</th></tr></thead>
+      <tbody id="routes">
+        {% for r in site.routes %}{{ routerow(loop.index0, r) }}{% endfor %}
+        {% if not site.routes %}{{ routerow(0, none) }}{% endif %}
+      </tbody>
+    </table>
+    <div class="row"><button type="button" class="btn small" id="addroute">+ Add host name</button></div>
+    <template id="tpl-route">{{ routerow('__R__', none) }}</template>
+    <template id="tpl-cond">{{ condrow('__R__', '__C__', none) }}</template>
+    <div class="flags">
+      <label class="chk big"><input type="checkbox" name="http" value="1" {{ 'checked' if site.http }}>
+        <span>Also answer on plain HTTP (port 80)<small>Otherwise port 80 redirects to HTTPS. Needed e.g. for CRL/AIA downloads of a CA or legacy clients.</small></span></label>
+      {% if site.type == 'proxy' %}
+      <label class="chk big"><input type="checkbox" name="http1" value="1" {{ 'checked' if site.http1 }}>
+        <span>HTTP/1.1 only (no HTTP/2)<small>Routes these host names by TLS name to a separate HTTP/1.1 frontend – required for Remote Desktop Gateway and other software without HTTP/2 support.</small></span></label>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if site.type == 'redirect' %}
+  <section class="card">
+    <h2>Redirect</h2>
+    <div class="grid2">
+      <label>Target URL <input name="target" value="{{ site.target }}" class="mono" placeholder="https://www.example.com" required></label>
+      <label>Status code <select name="code">{% for code in (302, 301, 307, 308) %}<option {{ 'selected' if site.code == code }}>{{ code }}</option>{% endfor %}</select></label>
+    </div>
+    <label class="chk"><input type="checkbox" name="keep_uri" value="1" {{ 'checked' if site.keep_uri }}>Append the requested path and query to the target</label>
+  </section>
+  {% else %}
+  <section class="card">
+    <h2>Servers</h2>
+    <table class="srvtable">
+      <thead><tr><th>Name</th><th>Address : port</th><th class="ctr">TLS</th><th class="ctr">Verify cert</th><th class="ctr">Health check</th><th>Other options</th><th>Status</th></tr></thead>
+      <tbody id="srvrows">
+        {% for s in site.servers %}{{ srvrow(loop.index0, s) }}{% endfor %}
+        {% if new and not site.servers %}{{ srvrow(0, none) }}{% endif %}
+      </tbody>
+    </table>
+    <template id="tpl-srv">{{ srvrow('__S__', none) }}</template>
+    <div class="row"><button type="button" class="btn small" id="addsrv">+ Add server</button>
+      <span class="hint">To remove a server, clear its name and address. Without "Verify cert" the backend certificate is not checked (internal servers with self-signed certificates).</span></div>
+  </section>
+
+  <section class="card">
+    <h2>Access</h2>
+    <div class="grid2">
+      <label>Allowed paths <span class="hint">one per line · <code>/owa</code> = begins with · <code>=/favicon.ico</code> = exactly · empty = everything allowed, otherwise others get 403</span>
+        <textarea name="allow_paths" rows="{{ [site.allow_paths|length + 1, 4]|max }}" class="mono">{{ site.allow_paths|join('\n') }}</textarea></label>
+      <label>Allowed client networks <span class="hint">e.g. <code>10.0.0.0/16</code> · empty = everyone · others get 403</span>
+        <textarea name="allow_src" rows="4" class="mono">{{ site.allow_src|join('\n') }}</textarea></label>
+    </div>
+    <h3 class="sub">Path redirects <span class="hint">checked before the path filter</span></h3>
+    <table>
+      <thead><tr><th>Path</th><th></th><th>Redirect to</th><th>Code</th></tr></thead>
+      <tbody id="rdrows">
+        {% for r in site.redirects %}{{ rdrow(loop.index0, r) }}{% endfor %}
+        {{ rdrow(site.redirects|length, none) }}
+      </tbody>
+    </table>
+    <template id="tpl-rd">{{ rdrow('__D__', none) }}</template>
+    <div class="row"><button type="button" class="btn small" id="addrd">+ Add redirect</button><span class="hint">Clear path and target to remove a redirect.</span></div>
+    <label class="chk big"><input type="checkbox" name="block" value="1" {{ 'checked' if site.block }}>
+      <span>Block everything else<small>Only the redirects above are answered, all other requests get 403 (also the case automatically when the site has no server).</small></span></label>
+  </section>
+
+  <details class="card" {{ 'open' if site.cookie or site.timeout_server or site.timeout_tunnel or site.extra }}>
+    <summary><h2 class="inline">Behaviour</h2> <span class="hint">load balancing, sessions, timeouts, extra directives</span></summary>
+    <div class="grid3">
+      <label>Load balancing <select name="balance">{% for b in ('leastconn', 'roundrobin', 'source', 'first') %}<option {{ 'selected' if site.balance == b }}>{{ b }}</option>{% endfor %}</select></label>
+      <label>Sticky session cookie <span class="hint">empty = off</span><input name="cookie" value="{{ site.cookie }}" class="mono" placeholder="SRVID"></label>
+      <label>Server timeout <span class="hint">default {{ st.model.global.timeouts.get('server', '') }}</span><input name="timeout_server" value="{{ site.timeout_server }}" class="mono" placeholder="4h"></label>
+      <label>Tunnel timeout <span class="hint">WebSocket/RDP, default {{ st.model.global.timeouts.get('tunnel', '') }}</span><input name="timeout_tunnel" value="{{ site.timeout_tunnel }}" class="mono" placeholder="4h"></label>
+    </div>
+    <label class="chk"><input type="checkbox" name="keepalive" value="1" {{ 'checked' if site.keepalive }}>Keep-alive to servers</label>
+    <label class="chk"><input type="checkbox" name="prefer_last" value="1" {{ 'checked' if site.prefer_last }}>Prefer last server (NTLM/Kerberos)</label>
+    <label class="chk"><input type="checkbox" name="srvtcpka" value="1" {{ 'checked' if site.srvtcpka }}>TCP keep-alive to servers</label>
+    <label style="margin-top:12px">Extra HAProxy directives for this backend <span class="hint">one per line, added after the options</span>
+      <textarea name="extra" class="editor" rows="{{ [site.extra|length + 1, 3]|max }}" spellcheck="false">{{ site.extra|join('\n') }}</textarea></label>
+  </details>
+  {% endif %}
+
+  {% if hsts_all %}<p class="hint">Note: HSTS is currently sent for all host names (Security → Response headers).</p>{% endif %}
+  <div class="actionbar">
+    <button class="btn primary" {{ 'disabled' if not st.managed }}>Preview changes</button>
+    <a class="btn" href="{{ url_for('main.sites') }}">Cancel</a>
+    <span class="hint">Nothing is changed until you confirm the preview.</span>
+  </div>
+</form>
+{% endblock %}

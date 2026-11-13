@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Preview{% endblock %}
+{% block content %}
+<h1>Preview: {{ c.source }}</h1>
+{% if stale %}<div class="flash error">haproxy.cfg changed on disk since this preview was created. Applying will be refused – start again.</div>{% endif %}
+{% if manual %}<div class="flash info">This file contains manual edits that are not part of the model. After applying, the tool will offer to import them.</div>{% endif %}
+{% if unchanged %}<div class="flash info">No differences to the current configuration.</div>{% endif %}
+
+<section class="card">
+  <h2>Validation <span class="badge {{ 'good' if valid else 'bad' }}">{{ 'valid' if valid else 'invalid' }}</span></h2>
+  <pre class="code small">{{ output or 'Configuration file is valid' }}</pre>
+</section>
+
+<section class="card">
+  <h2>Changes</h2>
+  {% if diff %}
+  <pre class="diff">{% for kind, line in diff %}<span class="{{ kind }}">{{ line }}</span>
+{% endfor %}</pre>
+  {% else %}<p class="muted">No changes.</p>{% endif %}
+</section>
+
+<section class="card">
+  {% if valid and not stale and not unchanged %}
+  <form method="post" action="{{ url_for('main.apply', cid=cid) }}" class="form" data-confirm="Apply this change to the LIVE HAProxy and reload it?">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <label>Reason / ticket <input name="reason" value="{{ c.source }}" maxlength="200"></label>
+    <p class="muted small">A backup of the current file is stored. HAProxy is reloaded gracefully (no dropped connections); if the reload fails, the previous file is restored automatically.</p>
+    <div class="row">
+      <button class="btn danger">Apply &amp; reload HAProxy</button>
+      <a class="btn" href="{{ url_for('main.preview_edit', cid=cid) }}">Edit further</a>
+      <a class="btn" href="{{ url_for('main.config') }}">Discard</a>
+    </div>
+  </form>
+  {% else %}
+  <div class="row">
+    <a class="btn" href="{{ url_for('main.preview_edit', cid=cid) }}">Edit</a>
+    <a class="btn" href="{{ url_for('main.config') }}">Discard</a>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

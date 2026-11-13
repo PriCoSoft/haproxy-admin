@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Request certificate{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <div><a class="back" href="{{ url_for('main.certs') }}">‹ Certificates</a><h1>Request certificate</h1></div>
+</div>
+<form method="post" action="{{ url_for('main.cert_new') }}" class="form">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <section class="card">
+    <h2>1 · Host names</h2>
+    <label><span class="hint">Space separated. The first name is used as certificate name. Example: <code>example.com *.example.com</code></span>
+      <input name="domains" required value="{{ domains }}" placeholder="app.customer.example" autofocus></label>
+  </section>
+
+  <section class="card">
+    <h2>2 · Validation</h2>
+    <div class="choices">
+      <label class="choice">
+        <input type="radio" name="method" value="dns" checked>
+        <span><strong>DNS-01</strong> – for own domains and wildcards
+          <small>
+          {% if dns.builtin %}
+            {% set enabled = (dns.providers or [])|selectattr('enabled')|list %}
+            {% if enabled %}The token is set through the DNS provider responsible for the domain:
+              {% for p in enabled %}<br><strong>{{ p.name }}</strong> ({{ dns.types[p.type].label }}) – {{ p.domains|join(', ') }} and their subdomains{% endfor %}
+            {% else %}<span class="warntext">No DNS provider configured yet.</span>{% endif %}
+            <br><a href="{{ url_for('main.cert_dns') }}">Manage DNS providers</a> · requests run one after another.
+          {% elif dns_err %}<span class="warntext">DNS providers not available: {{ dns_err }}</span>
+          {% else %}Uses the external hook <code>{{ dns.legacy.path if dns.legacy else '' }}</code> (admin.conf <code>dns_hook</code>).{% endif %}
+          </small></span>
+      </label>
+      <label class="choice {{ 'disabled' if not acme_route }}">
+        <input type="radio" name="method" value="http" {{ 'disabled' if not acme_route }}>
+        <span><strong>HTTP-01</strong> – for customer domains (e.g. app.customer.example)
+          <small>The host name must point to the proxy's public IP. HAProxy forwards <code>/.well-known/acme-challenge/</code> to certbot (port {{ http01_port }}). No wildcards.
+          {% if not acme_route %}<br><span class="warntext">Not available yet: the ACME route is missing – add it on the Dashboard (setup steps).</span>{% endif %}</small></span>
+      </label>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>3 · Options</h2>
+    <div class="grid2">
+      <label>Key type
+        <select name="key_type"><option value="rsa">RSA 2048 – maximum compatibility</option><option value="ecdsa">ECDSA P-256 – smaller, faster</option></select></label>
+      <label>Certificate name <span class="hint">optional</span><input name="name" placeholder="automatic"></label>
+    </div>
+    <label class="chk big"><input type="checkbox" name="staging" value="1" checked>
+      <span><strong>Test run (staging)</strong><small>Untrusted test certificate, not deployed to HAProxy, no rate limits. Untick for the real certificate.</small></span></label>
+  </section>
+
+  <div class="actionbar">
+    <button class="btn primary">Request certificate</button>
+    <span class="hint">The live log opens next. Real certificates are written to the HAProxy certificate directory automatically (also on every renewal).</span>
+  </div>
+</form>
+{% endblock %}

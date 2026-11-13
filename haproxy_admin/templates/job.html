@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Job{% endblock %}
+{% block content %}
+<h1>{{ job.title }}</h1>
+<p class="muted">Started {{ job.started|ts }} by {{ job.user }} ·
+  <span id="job-status">{% if job.running %}<span class="badge warn">running</span>{% elif job.rc == 0 %}<span class="badge good">finished</span>{% else %}<span class="badge bad">failed (rc {{ job.rc }})</span>{% endif %}</span></p>
+<pre class="code log" id="job-log" data-job-url="{{ url_for('main.job_json', job_id=job.id) }}">{% for l in job.lines %}{{ l }}
+{% endfor %}</pre>
+<a class="btn" href="{{ url_for('main.certs') }}">Back to certificates</a>
+{% endblock %}

@@ -1,0 +1,23 @@
+[Unit]
+Description=HAProxy Admin web UI
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=haproxy-admin
+Group=haproxy-admin
+SupplementaryGroups=haproxy
+EnvironmentFile=/etc/haproxy-admin/service.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/gunicorn --workers 1 --worker-class gthread --threads 8 \
+  --bind ${BIND} --certfile ${TLS_CERT} --keyfile ${TLS_KEY} \
+  --chdir /opt/haproxy-admin --access-logfile - --error-logfile - \
+  --timeout 180 haproxy_admin.wsgi:app
+Restart=on-failure
+RestartSec=5
+UMask=0027
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

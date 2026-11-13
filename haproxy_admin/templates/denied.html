@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Access denied{% endblock %}
+{% block content %}
+<div class="login card">
+  <h1>Access denied</h1>
+  <p>{{ user.name }} ({{ user.upn }}) does not have the app role <code>{{ role }}</code> for this server.</p>
+  <p class="muted small">Ask an Entra administrator to assign the role in the Enterprise Application.</p>
+  <a class="btn" href="{{ url_for('auth.login') }}">Back</a>
+</div>
+{% endblock %}

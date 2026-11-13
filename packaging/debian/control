@@ -1,0 +1,17 @@
+Package: haproxy-admin
+Version: @VERSION@
+Architecture: all
+Maintainer: PriCoSoft GmbH <103182047+PriCoSoft@users.noreply.github.com>
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.10), python3-flask, python3-msal, python3-jwt, python3-cryptography, gunicorn, socat, sudo, openssl, adduser, haproxy (>= 2.6), bind9-dnsutils | dnsutils
+Recommends: certbot
+Section: admin
+Priority: optional
+Homepage: https://github.com/PriCoSoft/haproxy-admin
+Description: Web UI to manage HAProxy sites and Let's Encrypt certificates
+ HAProxy Admin generates the complete haproxy.cfg from a model and manages
+ sites (host/path routing, servers, redirects), security (rate limiting,
+ block list, trusted networks, headers), certbot certificates (HTTP-01 and
+ DNS-01 with Cloudflare / IONOS) and shows the HAProxy traffic log.
+ Every change is validated, previewed as a diff, backed up and rolled back
+ automatically if the reload fails. Sign-in via Microsoft Entra ID.

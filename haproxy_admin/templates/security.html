@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}Security{% endblock %}
+{% macro rulerow(prefix, i, r) -%}
+<tr>
+  <td><select name="{{ prefix }}{{ i }}_action">{% for k, v in RATE_ACTIONS.items() %}<option value="{{ k }}" {{ 'selected' if r and r.action == k }}>{{ v[0] }}</option>{% endfor %}</select></td>
+  <td><input name="{{ prefix }}{{ i }}_err" value="{{ r.err_rate if r and r.err_rate else '' }}" type="number" min="0" placeholder="–"></td>
+  <td><input name="{{ prefix }}{{ i }}_req" value="{{ r.req_rate if r and r.req_rate else '' }}" type="number" min="0" placeholder="–"></td>
+  <td class="ctr">{% if r %}<input type="checkbox" name="{{ prefix }}{{ i }}_del" value="1">{% endif %}</td>
+</tr>
+{%- endmacro %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>Security</h1><p class="sub">Rate limiting / brute-force protection, block list, trusted networks and security headers.</p></div>
+</div>
+{% if not st.managed %}<div class="flash error">The configuration is not managed yet – settings can be saved after the <a href="{{ url_for('main.convert') }}">conversion</a>. Values below are read from the current file.</div>{% endif %}
+
+<section class="card" id="live">
+  <h2>Clients right now <span class="hint">per client IP, rates per {{ sec.http_window }} (TCP: {{ sec.tcp_window }}), entries expire after {{ sec.table_expire }} without traffic</span></h2>
+  {% if live_error %}<div class="flash error">{{ live_error }}</div>{% endif %}
+  {% if live %}
+  <input class="filter" data-filter="#livetable" placeholder="Filter IPs…">
+  <table id="livetable" class="livetable">
+    <tr><th>Client</th><th>Where</th><th class="num">Conn.</th><th class="num">Requests</th><th class="num">Errors 4xx</th><th class="num">Open</th><th></th></tr>
+    {% for e in live %}
+    {% set hot = drop_err is not none and e.get('http_err_rate', 0) > drop_err %}
+    <tr>
+      <td class="mono">{% if hot %}<span class="dot bad" title="currently above the drop threshold"></span>{% endif %}{{ e.key }}</td>
+      <td class="small">{{ e.table }}</td>
+      <td class="num">{{ e.get('conn_rate', '') }}</td><td class="num">{{ e.get('http_req_rate', '') }}</td>
+      <td class="num {{ 'warntext' if e.get('http_err_rate', 0) > 0 }}">{{ e.get('http_err_rate', '') }}</td>
+      <td class="num">{{ e.get('conn_cur', '') }}</td>
+      <td class="num nowrap">
+        <a class="btn small" href="{{ url_for('main.logs', q=e.key) }}" title="show log lines of this client">Log</a>
+        <form class="inline" method="post" action="{{ url_for('main.reset_client') }}"><input type="hidden" name="_csrf" value="{{ csrf_token() }}"><input type="hidden" name="table" value="{{ e.table }}"><input type="hidden" name="key" value="{{ e.key }}"><button class="btn small" title="reset the counters (lifts an automatic block)">Reset</button></form>
+        <form class="inline" method="post" action="{{ url_for('main.blocklist') }}" data-confirm="Block {{ e.key }} permanently?"><input type="hidden" name="_csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add"><input type="hidden" name="value" value="{{ e.key }}"><button class="btn small danger-outline">Block</button></form>
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">No tracked clients.</p>{% endif %}
+</section>
+
+<section class="card" id="blocklist">
+  <h2>Block list <span class="badge">{{ denylist|length }}</span> <span class="hint">connections from these addresses are rejected immediately on port 80 and 443 – takes effect at once, no reload</span></h2>
+  <form method="post" action="{{ url_for('main.blocklist') }}" class="row" style="margin-top:0">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="add">
+    <input name="value" class="mono" placeholder="203.0.113.7 or 198.51.100.0/24" style="max-width:360px; margin:0">
+    <button class="btn">Block</button>
+  </form>
+  {% if denylist %}
+  <table style="margin-top:12px">
+    {% for v in denylist %}
+    <tr><td class="mono">{{ v }}</td><td class="num">
+      <form method="post" action="{{ url_for('main.blocklist') }}"><input type="hidden" name="_csrf" value="{{ csrf_token() }}"><input type="hidden" name="action" value="del"><input type="hidden" name="value" value="{{ v }}"><button class="btn small">Unblock</button></form>
+    </td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  {% if st.managed and not denylist %}<p class="hint">Stored in <code>{{ denylist_path }}</code>.</p>{% endif %}
+</section>
+
+<form method="post" action="{{ url_for('main.security_save') }}" class="form">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <input type="hidden" name="base_sha" value="{{ st.sha }}">
+
+  <section class="card">
+    <h2>Rate limiting (brute-force protection)</h2>
+    <p class="hint">Every client IP is tracked. A rule fires when <em>all</em> its thresholds are exceeded (per {{ sec.http_window }}). "Errors" counts 4xx responses – failed logins, scans for non-existing paths, denied paths.
+      A dropped client stays blocked until its rate falls again; "Reset" above lifts it at once.</p>
+    <div class="grid2">
+      <div>
+        <h3 class="sub">HTTPS</h3>
+        <table class="ruletable">
+          <tr><th>Action</th><th>Errors &gt;</th><th>Requests &gt;</th><th class="ctr">Remove</th></tr>
+          {% for r in sec.rules_https %}{{ rulerow('rh', loop.index0, r) }}{% endfor %}
+          {{ rulerow('rh', sec.rules_https|length, none) }}
+        </table>
+      </div>
+      <div>
+        <h3 class="sub">HTTP (port 80)</h3>
+        <table class="ruletable">
+          <tr><th>Action</th><th>Errors &gt;</th><th>Requests &gt;</th><th class="ctr">Remove</th></tr>
+          {% for r in sec.rules_http %}{{ rulerow('rp', loop.index0, r) }}{% endfor %}
+          {{ rulerow('rp', sec.rules_http|length, none) }}
+        </table>
+      </div>
+    </div>
+    <p class="hint">Fill the empty last row to add a rule; save once per new rule.</p>
+    <h3 class="sub">Connection limits (TCP, port 443)</h3>
+    <div class="grid3">
+      <label>New connections per {{ sec.tcp_window }} &gt; <span class="hint">0 = off</span><input name="tcp_conn_rate" type="number" min="0" value="{{ sec.tcp_conn_rate }}"></label>
+      <label>Concurrent connections &gt; <span class="hint">0 = off</span><input name="tcp_conn_cur" type="number" min="0" value="{{ sec.tcp_conn_cur }}"></label>
+    </div>
+    <details class="sub">
+      <summary class="hint">Tracking table</summary>
+      <div class="grid3" style="margin-top:10px">
+        <label>Size <input name="table_size" value="{{ sec.table_size }}" class="mono"></label>
+        <label>Forget after <input name="table_expire" value="{{ sec.table_expire }}" class="mono"></label>
+        <label>HTTP window <input name="http_window" value="{{ sec.http_window }}" class="mono"></label>
+        <label>TCP window <input name="tcp_window" value="{{ sec.tcp_window }}" class="mono"></label>
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>Trusted networks</h2>
+    <div class="grid2">
+      <label>Networks <span class="hint">own public IP, internal networks</span>
+        <textarea name="trusted" rows="4" class="mono">{{ sec.trusted|join('\n') }}</textarea></label>
+      <div>
+        <label class="chk big"><input type="checkbox" name="exempt_trusted" value="1" {{ 'checked' if sec.exempt_trusted }}>
+          <span>Exempt from rate limiting<small>Recommended: otherwise many users behind your own NAT address (e.g. Outlook, RDP) can trigger the limits together. Connection limits always exempt trusted networks.</small></span></label>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Blocked TLS names (SNI)</h2>
+    <p class="hint">Connections whose TLS server name matches a pattern are rejected before any HTTP processing, unless the name is listed as exception.</p>
+    <table>
+      <tr><th>Pattern</th><th>Except</th></tr>
+      {% for b in sec.sni_block %}
+      <tr><td><input name="sb{{ loop.index0 }}_pattern" value="{{ b.pattern }}" class="mono"></td><td><input name="sb{{ loop.index0 }}_except" value="{{ b.except|join(' ') }}" class="mono"></td></tr>
+      {% endfor %}
+      <tr><td><input name="sb{{ sec.sni_block|length }}_pattern" class="mono" placeholder="autodiscover.*"></td><td><input name="sb{{ sec.sni_block|length }}_except" class="mono" placeholder="autodiscover.example.com"></td></tr>
+    </table>
+    <p class="hint">Clear the pattern to remove a row.</p>
+  </section>
+
+  <section class="card">
+    <h2>Response headers</h2>
+    <div class="grid2">
+      <label>Strict-Transport-Security (HSTS) <span class="hint">empty = not sent</span>
+        <input name="hsts" value="{{ hdr.hsts }}" class="mono" placeholder="max-age=31536000"></label>
+      <label>Send HSTS only for these domains and their subdomains <span class="hint">empty = all hosts · set this before serving customer domains</span>
+        <input name="hsts_domains" value="{{ hdr.hsts_domains|join(' ') }}" class="mono" placeholder="example.com example.net"></label>
+      <label>X-Frame-Options <span class="hint">only if the server did not set one · empty = off</span>
+        <input name="frame_options" value="{{ hdr.frame_options }}" class="mono" placeholder="SAMEORIGIN"></label>
+      <label>Server header <span class="hint">replaces the server's own header · empty = unchanged</span>
+        <input name="server" value="{{ hdr.server }}" class="mono" placeholder="nginx"></label>
+    </div>
+    <label class="chk"><input type="checkbox" name="nosniff" value="1" {{ 'checked' if hdr.nosniff }}>X-Content-Type-Options: nosniff</label>
+  </section>
+
+  <div class="actionbar">
+    <button class="btn primary" {{ 'disabled' if not st.managed }}>Preview changes</button>
+    <span class="hint">Nothing is changed until you confirm the preview.</span>
+  </div>
+</form>
+{% endblock %}

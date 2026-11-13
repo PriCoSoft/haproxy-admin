@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>Dashboard</h1><p class="sub">HAProxy {{ snap.info.get('Version', '?').split('-')[0] }} · running for {{ snap.info.get('Uptime', '?') }}</p></div>
+  <a class="btn primary" href="{{ url_for('main.site_new') }}">+ New site</a>
+</div>
+{% if snap.error %}<div class="flash error">{{ snap.error }}</div>{% endif %}
+{% if not st.managed %}<div class="flash error">The configuration is still hand-written. <a href="{{ url_for('main.convert') }}">Convert it once</a> to edit everything here.</div>
+{% elif st.drift %}<div class="flash error">haproxy.cfg was edited by hand. <a href="{{ url_for('main.convert') }}">Review and import the changes</a>.</div>{% endif %}
+
+<div class="tiles">
+  <a class="tile" href="{{ url_for('main.sites') }}"><div class="k">Sites</div><div class="v">{{ site_count }}</div><div class="s">{{ host_count }} host names</div></a>
+  <a class="tile {{ 'bad' if problems else 'good' }}" href="{{ url_for('main.sites') }}"><div class="k">Servers down</div><div class="v">{{ problems|length }}</div><div class="s">of {{ backs.values()|map(attribute='servers')|map('length')|sum }} servers</div></a>
+  <a class="tile {{ 'bad' if min_days is not none and min_days < 14 else 'warn' if min_days is not none and min_days < 30 else 'good' }}" href="{{ url_for('main.certs') }}"><div class="k">Next certificate expiry</div><div class="v">{{ min_days if min_days is not none else '–' }}<span class="unit"> days</span></div><div class="s">{{ snap.certs|length }} certificates loaded</div></a>
+  <div class="tile"><div class="k">Connections</div><div class="v">{{ snap.info.get('CurrConns', '?') }}</div><div class="s">limit {{ snap.info.get('Maxconn', '?') }}</div></div>
+</div>
+
+{% set attention = problems|length + expiring|length + uncovered|length %}
+<section class="card">
+  <h2>Needs attention {% if not attention %}<span class="badge good">all good</span>{% endif %}</h2>
+  {% if attention %}
+  <ul class="list">
+    {% for b, s in problems %}
+    <li><span class="dot bad"></span><div><strong>{{ s.name }}</strong> in {{ b }} is <strong>{{ s.status }}</strong>{% if s.check %} ({{ s.check }}){% endif %}<div class="muted small mono">{{ s.addr }}</div></div>
+      <a class="btn small" href="{{ url_for('main.site_edit', name=b) }}">Open site</a></li>
+    {% endfor %}
+    {% for c in expiring %}
+    <li><span class="dot warn"></span><div>Certificate <strong>{{ c.sans[0] if c.sans else c.path }}</strong> expires in <strong>{{ c.days_left }} days</strong><div class="muted small mono">{{ c.path }}</div></div>
+      <a class="btn small" href="{{ url_for('main.certs') }}">Certificates</a></li>
+    {% endfor %}
+    {% for h in uncovered %}
+    <li><span class="dot warn"></span><div><strong>{{ h }}</strong> has no matching certificate in HAProxy</div>
+      <a class="btn small" href="{{ url_for('main.cert_new_form', domains=h) }}">Request certificate</a></li>
+    {% endfor %}
+  </ul>
+  {% else %}<p class="muted">All servers are up, all host names have a certificate, nothing expires within 30 days.</p>{% endif %}
+</section>
+
+{% if open_checks %}
+<section class="card">
+  <h2>Recommended setup steps <span class="badge warn">{{ open_checks|length }} open</span></h2>
+  {% if cert_err %}<div class="flash error">Helper: {{ cert_err }}</div>{% endif %}
+  {% for c in open_checks %}
+  <details class="step">
+    <summary><strong>{{ c.title }}</strong></summary>
+    <p class="muted">{{ c.detail }}</p>
+    {% if c.link %}<a class="btn small" href="{{ c.link }}">{{ c.link_label }}</a>{% endif %}
+  </details>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Frontends</h2>
+  <table>
+    <tr><th>Name</th><th>Status</th><th class="num">Sessions</th><th class="num">Total</th><th class="num">Req/s</th></tr>
+    {% for f in fronts %}
+    <tr><td>{{ f.pxname }}</td><td><span class="badge {{ 'good' if f.status == 'OPEN' else 'bad' }}">{{ f.status }}</span></td><td class="num">{{ f.scur }}</td><td class="num">{{ f.stot }}</td><td class="num">{{ f.req_rate }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+{% endblock %}

@@ -1,0 +1,44 @@
+; HAProxy Admin configuration  (/etc/haproxy-admin/admin.conf, root:haproxy-admin 0640)
+
+[server]
+; Entra app role (value) a user needs for THIS server.
+; Empty = no role check: every user who can sign in is admin.
+;         -> Enable "Assignment required" on the Enterprise Application!
+hostname =
+; URL the browser uses to reach this UI (redirect URI = <public_url>/auth/callback)
+public_url = https://haproxy01.example.com:9443
+; Name shown in the header when hostname is empty
+display_name = haproxy01
+
+[auth]
+; entra | none   (none is only accepted when the service binds to 127.0.0.1 - testing via SSH tunnel)
+mode = entra
+tenant_id =
+client_id =
+; Either a certificate credential (recommended) ...
+client_cert_file = /etc/haproxy-admin/tls/cert.pem
+client_key_file = /etc/haproxy-admin/tls/key.pem
+; ... or a client secret stored in a file (root:haproxy-admin 0640)
+client_secret_file =
+session_hours = 8
+
+[haproxy]
+config = /etc/haproxy/haproxy.cfg
+socket = /run/haproxy/admin.sock
+; Block list (one IP/network per line), referenced by the generated configuration
+blocklist = /etc/haproxy/blocklist.acl
+; HAProxy traffic log written by rsyslog (Logs page)
+log_file = /var/log/haproxy.log
+
+[certs]
+; Directory for combined PEM files (fullchain + key) generated from certbot lineages
+cert_dir = /etc/haproxy/certs
+; crt-list file managed on the Certificates page
+crt_list = /etc/haproxy/crt-list.txt
+; DNS-01: "builtin" = providers configured under Certificates → DNS providers
+; (stored in /etc/haproxy-admin/dns-providers.json, root only). A path = external --manual-auth-hook script.
+dns_hook = builtin
+; certbot standalone port for HTTP-01 (HAProxy routes /.well-known/acme-challenge/ here)
+http01_port = 8402
+; Contact address for new ACME accounts (staging); empty = register without e-mail
+email =

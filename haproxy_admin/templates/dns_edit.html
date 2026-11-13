@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}{{ p.name or t.label }} · DNS provider{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <div><a class="back" href="{{ url_for('main.cert_dns') }}">‹ DNS providers</a>
+    <h1>{{ 'Edit' if p.id else 'New' }} {{ t.label }} provider</h1>
+    <p class="sub">{{ t.summary }}</p></div>
+</div>
+<form method="post" action="{{ url_for('main.cert_dns_save') }}" class="form" autocomplete="off">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <input type="hidden" name="id" value="{{ p.id }}">
+  <input type="hidden" name="type" value="{{ ptype }}">
+  <section class="card">
+    <h2>General</h2>
+    <div class="grid2">
+      <label>Name<input name="name" value="{{ p.name }}" required maxlength="60"></label>
+      <label class="chk"><input type="checkbox" name="enabled" value="1" {{ 'checked' if p.enabled }}>
+        <span>Enabled <small class="hint">disabled providers are ignored by the hook</small></span></label>
+    </div>
+    <label>Domains <span class="hint">one per line or space separated – each also covers its subdomains, e.g. <code>example.com</code> covers <code>shop.example.com</code> and <code>*.example.com</code></span>
+      <textarea name="domains" rows="4" class="mono" required placeholder="example.com">{{ p.domains|join('\n') }}</textarea></label>
+  </section>
+  <section class="card">
+    <h2>Access</h2>
+    <div class="grid2">
+      {% for f in t.fields %}
+      <label>{{ f.label }}
+        {% if f.secret %}
+        <input type="password" name="f_{{ f.key }}" autocomplete="new-password" spellcheck="false"
+               placeholder="{{ 'stored – leave empty to keep' if f.key in p.secrets_set else '' }}" {{ 'required' if f.key not in p.secrets_set }}>
+        {% else %}
+        <input name="f_{{ f.key }}" value="{{ p.settings.get(f.key, '') }}" class="mono" spellcheck="false" required>
+        {% endif %}
+        {% if f.hint %}<span class="hint">{{ f.hint }}</span>{% endif %}
+      </label>
+      {% endfor %}
+    </div>
+    <p class="hint">Secrets are written to the server's credential store (root only) and are never displayed again.</p>
+  </section>
+  <div class="actionbar">
+    <button class="btn primary">Save</button>
+    <a class="btn" href="{{ url_for('main.cert_dns') }}">Cancel</a>
+    <span class="hint">After saving, use <em>Test</em> on the provider card.</span>
+  </div>
+</form>
+{% endblock %}

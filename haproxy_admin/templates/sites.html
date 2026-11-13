@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}Sites{% endblock %}
+{% macro srvdots(servers) -%}
+  {% for s in servers %}<span class="srv" title="{{ s.name }} {{ s.address }} – {{ s.status or 'no status' }}"><span class="dot {{ 'good' if s.status.startswith('UP') else 'muted' if s.status in ('', 'no check') else 'bad' }}"></span>{{ s.name }}</span>{% endfor %}
+{%- endmacro %}
+{% macro siterow(row) -%}
+{% set s = row.site %}
+<a class="siterow {{ 'off' if not s.enabled }}" href="{{ url_for('main.site_edit', name=s.name) }}">
+  <div class="main">
+    <div class="hosts">
+      {% for h in row.hosts %}
+        <span class="host {{ 'nocert' if h.cert is none }}" title="{% for c in h.conds %}only if {{ c }}&#10;{% endfor %}{% if h.cert is none %}no certificate{% endif %}">{{ h.host }}{% if h.conds %}<em>{{ h.conds|length }} cond.</em>{% endif %}</span>
+      {% endfor %}
+    </div>
+    <div class="meta">
+      {% if not s.enabled %}<span class="badge warn">disabled</span>{% endif %}
+      {% if s.http %}<span class="badge" title="also answers on port 80">HTTP</span>{% endif %}
+      {% if s.http1 %}<span class="badge" title="HTTP/1.1 only">h1</span>{% endif %}
+      {% if s.allow_paths %}<span class="badge" title="{{ s.allow_paths|join(' ') }}">{{ s.allow_paths|length }} paths</span>{% endif %}
+      {% if s.allow_src %}<span class="badge" title="{{ s.allow_src|join(' ') }}">IP restricted</span>{% endif %}
+      {{ s.description or '' }} <span class="mono">· {{ s.name }}</span>
+    </div>
+  </div>
+  {% if s.type == 'redirect' %}
+  <div class="servers"><span class="small">→ {{ s.target }}{{ '…' if s.keep_uri }}</span></div>
+  {% else %}
+  <div class="servers">{{ srvdots(row.servers) }}{% if not row.servers %}<span class="muted small">no server{{ ' · redirects only' if s.redirects }}</span>{% endif %}</div>
+  {% endif %}
+  <span class="chev">›</span>
+</a>
+{%- endmacro %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>Sites</h1><p class="sub">Websites and services published through this proxy. Click a site to edit it.</p></div>
+  <div class="row">
+    <a class="btn" href="{{ url_for('main.site_new', type='redirect') }}">+ Redirect</a>
+    <a class="btn primary" href="{{ url_for('main.site_new') }}">+ New site</a>
+  </div>
+</div>
+{% if not st.managed %}<div class="flash error">This configuration is not managed by HAProxy Admin yet. The list below is read from the hand-written file. <a href="{{ url_for('main.convert') }}">Review the conversion</a> to edit sites here.</div>
+{% elif st.drift %}<div class="flash error">haproxy.cfg was edited by hand. <a href="{{ url_for('main.convert') }}">Import the changes</a> before editing.</div>{% endif %}
+{% if rt_error %}<div class="flash error">{{ rt_error }}</div>{% endif %}
+<input class="filter" data-filter="#sites" placeholder="Search host names, servers, names…" autofocus>
+
+{% set proxies = rows|selectattr('site.type', 'equalto', 'proxy')|list %}
+{% set redirects = rows|rejectattr('site.type', 'equalto', 'proxy')|list %}
+<div class="sitelist" id="sites">
+  {% for row in proxies|sort(attribute='site.name') %}{{ siterow(row) }}{% else %}<p class="muted">No sites yet.</p>{% endfor %}
+  {% if redirects %}<div class="navgroup listgroup">Redirects</div>{% endif %}
+  {% for row in redirects %}{{ siterow(row) }}{% endfor %}
+</div>
+{% endblock %}

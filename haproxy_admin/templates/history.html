@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}History{% endblock %}
+{% block content %}
+<h1>History</h1>
+<p class="muted">Each apply stores the previous haproxy.cfg. Restoring goes through the normal preview/validation.</p>
+<table>
+  <tr><th>Time (UTC)</th><th>By</th><th>Reason</th><th>Size</th><th></th></tr>
+  {% for i in items %}
+  <tr><td class="mono">{{ i.time }}</td><td>{{ i.actor }}</td><td>{{ i.reason }}</td><td class="muted">{{ i.size }} B</td>
+    <td><a class="btn small" href="{{ url_for('main.history_view', bid=i.id) }}">View</a></td></tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">No backups yet.</td></tr>
+  {% endfor %}
+</table>
+{% endblock %}

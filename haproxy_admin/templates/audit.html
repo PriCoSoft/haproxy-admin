@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Audit{% endblock %}
+{% block content %}
+<h1>Audit log</h1>
+<input class="filter" data-filter="#audit" placeholder="Filter…">
+<table id="audit">
+  <tr><th>Time (UTC)</th><th>User</th><th>IP</th><th>Action</th><th>Detail</th></tr>
+  {% for e in entries %}
+  <tr><td class="mono small">{{ e.time }}</td><td>{{ e.user }}</td><td class="mono small">{{ e.ip }}</td><td><span class="badge">{{ e.action }}</span></td><td>{{ e.detail }}</td></tr>
+  {% else %}<tr><td colspan="5" class="muted">No entries.</td></tr>{% endfor %}
+</table>
+{% endblock %}

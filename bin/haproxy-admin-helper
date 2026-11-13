@@ -1,0 +1,903 @@
+#!/usr/bin/python3 -I
+"""haproxy-admin privileged helper.
+
+Runs as root via sudo (see /etc/sudoers.d/haproxy-admin). It only offers a fixed set of
+sub-commands with strictly validated arguments; it never runs shell commands built from input.
+
+Note: editing haproxy.cfg is root-equivalent by nature (e.g. lua-load is executed by the
+HAProxy master as root). Only trusted administrators may use the web UI.
+"""
+import argparse
+import configparser
+import contextlib
+import datetime
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import socket
+import stat
+import subprocess
+import sys
+import syslog
+import tempfile
+import time
+
+CONF_FILE = "/etc/haproxy-admin/admin.conf"
+STATE = "/var/lib/haproxy-admin"
+BACKUPS = os.path.join(STATE, "backups")
+TMP = os.path.join(STATE, "tmp")
+LE = "/etc/letsencrypt"
+HAPROXY_BIN = "/usr/sbin/haproxy"
+SELF = os.path.realpath(__file__)
+MAX_CFG = 4 * 1024 * 1024
+KEEP_BACKUPS = 200
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{0,62}$")
+DOMAIN_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+ACTOR_RE = re.compile(r"^[\w.@+ -]{1,128}$")
+BACKUP_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+CERT_BLOCK = re.compile(rb"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.S)
+
+ACTOR = "unknown"
+
+# DNS provider module lives next to this script (root-owned directory; -I mode ignores the script dir).
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(SELF))
+import hpa_dns  # noqa: E402
+
+
+# ----------------------------------------------------------------------------- basics
+def load_conf():
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None)
+    cp.read(CONF_FILE, encoding="utf-8")
+
+    def g(section, key, default):
+        v = (cp.get(section, key, fallback="") or "").strip()
+        return v or default
+
+    return {
+        "cfg": g("haproxy", "config", "/etc/haproxy/haproxy.cfg"),
+        "socket": g("haproxy", "socket", "/run/haproxy/admin.sock"),
+        "blocklist": g("haproxy", "blocklist", "/etc/haproxy/blocklist.acl"),
+        "log_file": g("haproxy", "log_file", "/var/log/haproxy.log"),
+        "cert_dir": g("certs", "cert_dir", "/etc/haproxy/certs"),
+        "crt_list": g("certs", "crt_list", "/etc/haproxy/crt-list.txt"),
+        "dns_hook": g("certs", "dns_hook", "builtin"),
+        "http01_port": int(g("certs", "http01_port", "8402")),
+        "email": g("certs", "email", ""),
+    }
+
+
+def log(msg):
+    syslog.syslog(syslog.LOG_INFO, f"actor={ACTOR} {msg}")
+
+
+def die(msg, rc=2):
+    print(msg, file=sys.stderr)
+    log(f"error: {msg}")
+    sys.exit(rc)
+
+
+def out_json(obj, rc=0):
+    print(json.dumps(obj, ensure_ascii=False))
+    sys.exit(rc)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+@contextlib.contextmanager
+def lock(name):
+    path = f"/run/haproxy-admin-{name}.lock"
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def write_atomic(path, data, mode=0o600, like=None):
+    st = os.stat(like) if like and os.path.exists(like) else None
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".hpa-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if st:
+            os.chown(tmp, st.st_uid, st.st_gid)
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        else:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def read_stdin():
+    data = sys.stdin.buffer.read(MAX_CFG + 1)
+    if len(data) > MAX_CFG:
+        die("input too large")
+    return data
+
+
+def rt(conf, command, timeout=10):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(conf["socket"])
+        s.sendall(command.encode() + b"\n")
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    return b"".join(chunks).decode("utf-8", "replace")
+
+
+# ----------------------------------------------------------------------------- config
+def validate_bytes(data, cfg_path=None):
+    """Validate a candidate configuration. Returns (rc, output)."""
+    if cfg_path:
+        p = subprocess.run([HAPROXY_BIN, "-c", "-f", cfg_path], capture_output=True, text=True, timeout=60)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    os.makedirs(TMP, mode=0o700, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="candidate-", suffix=".cfg", dir=TMP)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        p = subprocess.run([HAPROXY_BIN, "-c", "-f", path], capture_output=True, text=True, timeout=60)
+        return p.returncode, (p.stdout + p.stderr).replace(path, "<candidate>").strip()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def reload_haproxy():
+    p = subprocess.run(["systemctl", "reload", "haproxy"], capture_output=True, text=True, timeout=90)
+    time.sleep(1.5)
+    a = subprocess.run(["systemctl", "is-active", "haproxy"], capture_output=True, text=True)
+    ok = p.returncode == 0 and a.stdout.strip() == "active"
+    return ok, ((p.stdout + p.stderr).strip() + f"\nhaproxy service: {a.stdout.strip()}").strip()
+
+
+def backup(data, reason):
+    os.makedirs(BACKUPS, mode=0o700, exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bid = f"{ts}-{sha256(data)[:8]}"
+    write_atomic(os.path.join(BACKUPS, bid + ".cfg"), data)
+    meta = {"id": bid, "time": ts, "actor": ACTOR, "reason": reason, "sha256": sha256(data), "size": len(data)}
+    write_atomic(os.path.join(BACKUPS, bid + ".json"), json.dumps(meta).encode())
+    files = sorted(glob.glob(os.path.join(BACKUPS, "*.cfg")))
+    for old in files[:-KEEP_BACKUPS]:
+        for ext in (".cfg", ".json"):
+            with contextlib.suppress(OSError):
+                os.unlink(old[:-4] + ext)
+    return bid
+
+
+def cmd_validate(args, conf):
+    data = read_stdin()
+    if conf["blocklist"].encode() in data:
+        ensure_blocklist(conf)
+    rc, out = validate_bytes(data)
+    print(out)
+    sys.exit(0 if rc == 0 else 1)
+
+
+def cmd_apply(args, conf):
+    if not SHA_RE.match(args.expect_sha):
+        die("invalid --expect-sha")
+    reason = re.sub(r"[\x00-\x1f]", " ", args.reason or "")[:200]
+    data = read_stdin()
+    cfg = conf["cfg"]
+    with lock("config"):
+        with open(cfg, "rb") as f:
+            current = f.read()
+        if sha256(current) != args.expect_sha:
+            out_json({"ok": False, "stage": "conflict",
+                      "output": "haproxy.cfg was changed on disk in the meantime. Nothing was applied."}, 1)
+        if data == current:
+            out_json({"ok": True, "changed": False, "output": "No changes."})
+        if conf["blocklist"].encode() in data:
+            ensure_blocklist(conf)
+        rc, vout = validate_bytes(data)
+        if rc != 0:
+            out_json({"ok": False, "stage": "validate", "output": vout}, 1)
+        bid = backup(current, f"before: {reason}")
+        write_atomic(cfg, data, like=cfg)
+        ok, rout = reload_haproxy()
+        if not ok:
+            write_atomic(cfg, current, like=cfg)
+            ok2, rout2 = reload_haproxy()
+            log(f"apply FAILED, rolled back to {bid}: {rout}")
+            out_json({"ok": False, "stage": "reload", "output": rout, "rolled_back": True,
+                      "rollback_ok": ok2, "rollback_output": rout2, "backup": bid}, 1)
+        log(f"apply OK reason={reason!r} backup={bid} sha={sha256(data)}")
+        out_json({"ok": True, "changed": True, "backup": bid, "output": (vout + "\n" + rout).strip()})
+
+
+def cmd_history(args, conf):
+    items = []
+    for p in sorted(glob.glob(os.path.join(BACKUPS, "*.json")), reverse=True):
+        try:
+            with open(p, encoding="utf-8") as f:
+                items.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    out_json(items)
+
+
+def cmd_backup_show(args, conf):
+    if not BACKUP_ID_RE.match(args.id):
+        die("invalid backup id")
+    path = os.path.join(BACKUPS, args.id + ".cfg")
+    if not os.path.isfile(path):
+        die("backup not found", 4)
+    with open(path, "rb") as f:
+        sys.stdout.buffer.write(f.read())
+
+
+# ----------------------------------------------------------------------------- certificates
+def cert_info(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        st = os.stat(path)
+    except OSError as e:
+        return {"path": path, "error": str(e)}
+    blocks = CERT_BLOCK.findall(data)
+    if not blocks:
+        return {"path": path, "error": "no certificate found"}
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    c = x509.load_pem_x509_certificate(blocks[0])
+    try:
+        sans = c.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+    except x509.ExtensionNotFound:
+        sans = []
+    na = getattr(c, "not_valid_after_utc", None) or c.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+    nb = getattr(c, "not_valid_before_utc", None) or c.not_valid_before.replace(tzinfo=datetime.timezone.utc)
+
+    def cn(name):
+        attrs = name.get_attributes_for_oid(NameOID.COMMON_NAME)
+        return attrs[0].value if attrs else name.rfc4514_string()
+
+    kt = type(c.public_key()).__name__
+    issuer = cn(c.issuer)
+    return {
+        "path": path, "subject": cn(c.subject), "issuer": issuer, "sans": sans,
+        "not_before": nb.isoformat(), "not_after": na.isoformat(),
+        "days_left": int((na - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 86400),
+        "key_type": "RSA" if "RSA" in kt else "ECDSA" if "Elliptic" in kt else kt,
+        "staging": "STAGING" in issuer.upper(), "mode": oct(stat.S_IMODE(st.st_mode)),
+    }
+
+
+def parse_renewal(path):
+    cp = configparser.ConfigParser(interpolation=None)
+    with open(path, encoding="utf-8") as f:
+        cp.read_string("[__top__]\n" + f.read())
+    return dict(cp["renewalparams"]) if cp.has_section("renewalparams") else {}
+
+
+def lineage_names():
+    return [os.path.basename(p)[:-5] for p in sorted(glob.glob(os.path.join(LE, "renewal", "*.conf")))]
+
+
+def cmd_certs(args, conf):
+    lineages, names = [], set()
+    for name in lineage_names():
+        names.add(name)
+        params = parse_renewal(os.path.join(LE, "renewal", name + ".conf"))
+        server = params.get("server", "")
+        auth_hook = params.get("manual_auth_hook", "") or ""
+        item = {
+            "name": name, "server": server, "staging": "staging" in server,
+            "authenticator": params.get("authenticator", ""),
+            "challenge": (params.get("pref_challs", "") or "").strip(", "),
+            "renew_hook": params.get("renew_hook", ""),
+            "managed": SELF in (params.get("renew_hook", "") or ""),
+            "dns_hook": "builtin" if SELF in auth_hook else ("legacy" if auth_hook else ""),
+            "cert": cert_info(os.path.join(LE, "live", name, "cert.pem")),
+        }
+        dep = os.path.join(conf["cert_dir"], name + ".pem")
+        item["deployed"] = cert_info(dep) if os.path.exists(dep) else None
+        leg = os.path.join(LE, "live", name + ".pem")
+        item["legacy"] = cert_info(leg) if os.path.exists(leg) else None
+        lineages.append(item)
+    other = []
+    for p in sorted(glob.glob(os.path.join(conf["cert_dir"], "*.pem"))):
+        n = os.path.basename(p)[:-4]
+        if n not in names:
+            info = cert_info(p)
+            info["name"] = n
+            other.append(info)
+    out_json({"lineages": lineages, "other": other, "cert_dir": conf["cert_dir"]})
+
+
+def runtime_update(conf, path, pem_text):
+    try:
+        loaded = rt(conf, "show ssl cert")
+    except OSError as e:
+        return f"{path}: runtime API not reachable ({e}); will be loaded on next reload"
+    paths = [l.strip().lstrip("*") for l in loaded.splitlines() if l.strip() and not l.startswith("#")]
+    if path not in paths:
+        return f"{path}: not loaded by HAProxy (picked up on next reload if referenced)"
+    r1 = rt(conf, f"set ssl cert {path} <<\n{pem_text.strip()}\n")
+    if "Transaction" not in r1:
+        rt(conf, f"abort ssl cert {path}")
+        return f"{path}: runtime update FAILED: {r1.strip()}"
+    r2 = rt(conf, f"commit ssl cert {path}")
+    if "Success" not in r2:
+        return f"{path}: commit FAILED: {r2.strip()}"
+    return f"{path}: updated in running HAProxy without reload"
+
+
+def _pem_clean(data):
+    return "\n".join(l for l in data.decode("utf-8").splitlines() if l.strip()) + "\n"
+
+
+def deploy_lineage(conf, name):
+    if not NAME_RE.match(name):
+        die("invalid name")
+    if name.startswith("staging-"):
+        print(f"{name}: staging certificate, not deployed to HAProxy")
+        return
+    live = os.path.join(LE, "live", name)
+    with open(os.path.join(live, "fullchain.pem"), "rb") as f:
+        fullchain = f.read()
+    with open(os.path.join(live, "privkey.pem"), "rb") as f:
+        key = f.read()
+    pem = _pem_clean(fullchain) + _pem_clean(key)
+    os.makedirs(conf["cert_dir"], mode=0o700, exist_ok=True)
+    target = os.path.join(conf["cert_dir"], name + ".pem")
+    write_atomic(target, pem.encode(), mode=0o600)
+    print(f"Wrote {target} (0600)")
+    print(runtime_update(conf, target, pem))
+    legacy = os.path.join(LE, "live", name + ".pem")
+    if os.path.exists(legacy):
+        write_atomic(legacy, pem.encode(), like=legacy)
+        print(f"Updated legacy file {legacy}")
+        print(runtime_update(conf, legacy, pem))
+    log(f"deployed certificate {name}")
+
+
+def certbot(cmd):
+    print("$ " + " ".join(cmd), flush=True)
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    p = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL)
+    return p.returncode
+
+
+def cmd_issue(args, conf):
+    name = args.name.lower()
+    domains = [d.lower() for d in args.domain]
+    if not NAME_RE.match(name):
+        die("invalid certificate name")
+    if not domains or len(domains) > 20 or not all(DOMAIN_RE.match(d) for d in domains):
+        die("invalid domain list")
+    if args.staging and not name.startswith("staging-"):
+        name = "staging-" + name
+    if not args.staging and name.startswith("staging-"):
+        die("the 'staging-' prefix is reserved for staging certificates")
+    if args.method == "http" and any(d.startswith("*.") for d in domains):
+        die("wildcard certificates require DNS-01")
+    renewal = os.path.join(LE, "renewal", name + ".conf")
+    if os.path.exists(renewal):
+        is_staging = "staging" in parse_renewal(renewal).get("server", "")
+        if is_staging != args.staging:
+            die("an existing certificate with this name uses the other ACME environment")
+
+    cmd = ["certbot", "certonly", "--non-interactive", "--agree-tos", "--keep-until-expiring",
+           "--cert-name", name, "--key-type", args.key_type,
+           "--deploy-hook", f"{SELF} deploy-hook"]
+    if args.key_type == "ecdsa":
+        cmd += ["--elliptic-curve", "secp256r1"]
+    if args.staging:
+        cmd += ["--test-cert"]
+    cmd += ["--email", conf["email"]] if conf["email"] else ["--register-unsafely-without-email"]
+    if args.method == "dns" and builtin_dns(conf):
+        store = hpa_dns.load_store()
+        missing = [d for d in domains if not hpa_dns.find_provider(store, d)]
+        if missing:
+            die(f"No DNS provider configured for {', '.join(missing)} (Certificates → DNS providers)")
+        cmd += ["--manual", "--preferred-challenges", "dns",
+                "--manual-auth-hook", f"{SELF} dns-auth", "--manual-cleanup-hook", f"{SELF} dns-cleanup"]
+    elif args.method == "dns":
+        hook = conf["dns_hook"]
+        if not (os.path.isfile(hook) and os.access(hook, os.X_OK)):
+            die(f"DNS hook {hook} missing or not executable")
+        cmd += ["--manual", "--preferred-challenges", "dns", "--manual-auth-hook", hook]
+    else:
+        cmd += ["--standalone", "--preferred-challenges", "http",
+                "--http-01-address", "127.0.0.1", "--http-01-port", str(conf["http01_port"])]
+    for d in domains:
+        cmd += ["-d", d]
+    log(f"issue {name} {domains} method={args.method} staging={args.staging}")
+    with lock("certbot"):
+        rc = certbot(cmd)
+    print(f"\ncertbot finished with exit code {rc}")
+    sys.exit(rc)
+
+
+def cmd_renew(args, conf):
+    if args.name not in lineage_names():
+        die("unknown certificate")
+    cmd = ["certbot", "renew", "--non-interactive", "--no-random-sleep-on-renew", "--cert-name", args.name,
+           "--deploy-hook", f"{SELF} deploy-hook"]
+    if args.force:
+        cmd.append("--force-renewal")
+    log(f"renew {args.name} force={args.force}")
+    with lock("certbot"):
+        rc = certbot(cmd)
+    sys.exit(rc)
+
+
+def cmd_auto_deploy(args, conf):
+    """Attach the deploy hook to an existing lineage (certbot reconfigure = dry run against staging +
+    save renewal options), then deploy the current certificate once."""
+    if args.name not in lineage_names():
+        die("unknown certificate")
+    log(f"auto-deploy {args.name}")
+    with lock("certbot"):
+        rc = certbot(["certbot", "reconfigure", "--non-interactive", "--cert-name", args.name,
+                      "--deploy-hook", f"{SELF} deploy-hook"])
+    if rc == 0 and not args.name.startswith("staging-"):
+        print()
+        deploy_lineage(conf, args.name)
+    print(f"\ncertbot finished with exit code {rc}")
+    sys.exit(rc)
+
+
+# ----------------------------------------------------------------------------- DNS providers
+def builtin_dns(conf):
+    return conf["dns_hook"] in ("", "builtin")
+
+
+def legacy_hook_path(conf):
+    """Existing external hook script that a plugin can import (None if no importer is installed)."""
+    if not builtin_dns(conf):
+        return conf["dns_hook"]
+    return hpa_dns.LEGACY["path"] if hpa_dns.LEGACY else None
+
+
+def legacy_importable(conf, store):
+    path = legacy_hook_path(conf)
+    return bool(path and hpa_dns.LEGACY and os.path.isfile(path) and hpa_dns.LEGACY["parse"](path) is not None
+                and not any(p["type"] == hpa_dns.LEGACY["type"] for p in store["providers"]))
+
+
+def cmd_dns_list(args, conf):
+    store = hpa_dns.load_store()
+    out_json({"types": hpa_dns.public_types(), "providers": [hpa_dns.public_provider(p) for p in store["providers"]],
+              "builtin": builtin_dns(conf),
+              "legacy": {"path": legacy_hook_path(conf), "importable": legacy_importable(conf, store),
+                         "label": hpa_dns.LEGACY["name"] if hpa_dns.LEGACY else ""}})
+
+
+def _save_provider(new):
+    with lock("dns"):
+        store = hpa_dns.load_store()
+        try:
+            p = hpa_dns.validate_provider(new, store)
+        except hpa_dns.DNSError as e:
+            out_json({"ok": False, "error": str(e)}, 1)
+        store["providers"] = [x for x in store["providers"] if x["id"] != p["id"]] + [p]
+        store["providers"].sort(key=lambda x: x["name"].lower())
+        hpa_dns.save_store(store)
+    log(f"dns provider saved id={p['id']} type={p['type']} domains={','.join(p['domains'])}")
+    return p
+
+
+def cmd_dns_save(args, conf):
+    try:
+        new = json.loads(read_stdin().decode("utf-8"))
+    except ValueError:
+        die("invalid JSON")
+    if not isinstance(new, dict):
+        die("invalid input")
+    p = _save_provider(new)
+    out_json({"ok": True, "id": p["id"]})
+
+
+def cmd_dns_delete(args, conf):
+    with lock("dns"):
+        store = hpa_dns.load_store()
+        if not any(p["id"] == args.id for p in store["providers"]):
+            out_json({"ok": False, "error": "unknown provider"}, 1)
+        store["providers"] = [p for p in store["providers"] if p["id"] != args.id]
+        hpa_dns.save_store(store)
+    log(f"dns provider deleted id={args.id}")
+    out_json({"ok": True})
+
+
+def cmd_dns_import_legacy(args, conf):
+    path = legacy_hook_path(conf)
+    if not path or not hpa_dns.LEGACY:
+        out_json({"ok": False, "error": "no importer for existing hook scripts installed"}, 1)
+    L = hpa_dns.LEGACY
+    settings = L["parse"](path)
+    if not settings:
+        out_json({"ok": False, "error": f"{path} not found or not in the expected format"}, 1)
+    if any(p["type"] == L["type"] for p in hpa_dns.load_store()["providers"]):
+        out_json({"ok": False, "error": f"a {L['name']} provider exists already"}, 1)
+    domains = []
+    for name in lineage_names():
+        params = parse_renewal(os.path.join(LE, "renewal", name + ".conf"))
+        if params.get("manual_auth_hook", "") != path or "staging" in params.get("server", ""):
+            continue
+        for d in (cert_info(os.path.join(LE, "live", name, "cert.pem")).get("sans") or []):
+            d = d[2:] if d.startswith("*.") else d
+            if d not in domains:
+                domains.append(d)
+    if not domains:
+        out_json({"ok": False, "error": f"no certificate uses {path} – add the provider manually"}, 1)
+    p = _save_provider({"type": L["type"], "name": L["name"], "domains": domains, "settings": settings})
+    out_json({"ok": True, "id": p["id"], "domains": p["domains"]})
+
+
+def cmd_dns_test(args, conf):
+    store = hpa_dns.load_store()
+    p = next((x for x in store["providers"] if x["id"] == args.id), None)
+    if not p:
+        die("unknown provider")
+    domain = (args.domain or "").lower().lstrip("*.") or None
+    if domain and (not DOMAIN_RE.match(domain) or hpa_dns.find_provider(store, domain) is not p):
+        die(f"{domain} is not handled by this provider")
+    log(f"dns test id={p['id']} domain={domain}")
+    try:
+        ok = hpa_dns.run_test(p, domain)
+    except hpa_dns.DNSError as e:
+        print(f"FAILED: {e}")
+        ok = False
+    with lock("dns"):
+        store = hpa_dns.load_store()
+        for x in store["providers"]:
+            if x["id"] == p["id"]:
+                x["last_test"] = {"time": int(time.time()), "ok": ok, "domain": domain, "actor": ACTOR}
+        hpa_dns.save_store(store)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_dns_auth(args, conf):
+    try:
+        hpa_dns.hook_auth(os.environ)
+    except hpa_dns.DNSError as e:
+        print(f"DNS hook error: {e}", flush=True)
+        log(f"dns-auth failed: {e}")
+        sys.exit(1)
+
+
+def cmd_dns_cleanup(args, conf):
+    try:
+        hpa_dns.hook_cleanup(os.environ)
+    except Exception as e:  # never fail certbot because of cleanup
+        print(f"DNS cleanup warning: {e}", flush=True)
+
+
+def set_renewal_params(path, values):
+    """Set/replace keys in [renewalparams] of a certbot renewal file (keeps everything else)."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    try:
+        start = next(i for i, l in enumerate(lines) if l.strip() == "[renewalparams]")
+    except StopIteration:
+        die("renewal file has no [renewalparams] section")
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].strip().startswith("[")), len(lines))
+    todo = dict(values)
+    for i in range(start + 1, end):
+        k = lines[i].split("=", 1)[0].strip()
+        if "=" in lines[i] and k in todo:
+            lines[i] = f"{k} = {todo.pop(k)}"
+    for k, v in todo.items():
+        lines.insert(start + 1, f"{k} = {v}")
+    write_atomic(path, ("\n".join(lines) + "\n").encode(), like=path)
+
+
+def cmd_dns_switch(args, conf):
+    """Switch an existing DNS-01 lineage to the built-in hook (+ deploy hook); test with renew --dry-run."""
+    name = args.name
+    if name not in lineage_names():
+        die("unknown certificate")
+    path = os.path.join(LE, "renewal", name + ".conf")
+    params = parse_renewal(path)
+    if params.get("authenticator") != "manual" or "dns" not in params.get("pref_challs", ""):
+        die("not a DNS-01 (manual) certificate")
+    store = hpa_dns.load_store()
+    sans = cert_info(os.path.join(LE, "live", name, "cert.pem")).get("sans") or []
+    missing = [d for d in sans if not hpa_dns.find_provider(store, d)]
+    if missing:
+        die(f"No DNS provider configured for {', '.join(missing)} (Certificates → DNS providers)")
+    with open(path, "rb") as f:
+        original = f.read()
+    log(f"dns-switch {name}")
+    with lock("certbot"):
+        set_renewal_params(path, {"manual_auth_hook": f"{SELF} dns-auth",
+                                  "manual_cleanup_hook": f"{SELF} dns-cleanup",
+                                  "renew_hook": f"{SELF} deploy-hook"})
+        print(f"Updated {path}: built-in DNS hook + deploy hook. Testing with a dry run (Let's Encrypt staging):\n",
+              flush=True)
+        rc = certbot(["certbot", "renew", "--non-interactive", "--no-random-sleep-on-renew", "--cert-name", name,
+                      "--dry-run"])
+        if rc != 0:
+            write_atomic(path, original, like=path)
+            print(f"\nDry run failed – previous renewal settings restored.\ncertbot finished with exit code {rc}")
+            log(f"dns-switch {name} failed, restored")
+            sys.exit(rc)
+    if not name.startswith("staging-"):
+        print()
+        deploy_lineage(conf, name)
+    print(f"\nSwitched {name} to the built-in DNS hook.\ncertbot finished with exit code 0")
+
+
+def cmd_delete(args, conf):
+    if args.name not in lineage_names():
+        die("unknown certificate")
+    if not args.name.startswith("staging-"):
+        die("only staging certificates can be deleted from the web UI")
+    log(f"delete {args.name}")
+    with lock("certbot"):
+        rc = certbot(["certbot", "delete", "--non-interactive", "--cert-name", args.name])
+    sys.exit(rc)
+
+
+def cmd_deploy(args, conf):
+    if args.name not in lineage_names():
+        die("unknown certificate")
+    deploy_lineage(conf, args.name)
+
+
+def cmd_deploy_hook(args, conf):
+    lineage = os.environ.get("RENEWED_LINEAGE", "")
+    if not lineage.startswith(os.path.join(LE, "live") + "/"):
+        die("RENEWED_LINEAGE not set or unexpected")
+    deploy_lineage(conf, os.path.basename(lineage.rstrip("/")))
+
+
+def cmd_crtlist_write(args, conf):
+    paths = []
+    for n in args.names:
+        if not NAME_RE.match(n):
+            die("invalid name")
+        p = os.path.join(conf["cert_dir"], n + ".pem")
+        if not os.path.isfile(p):
+            die(f"{p} does not exist (deploy the certificate first)")
+        if p not in paths:
+            paths.append(p)
+    target = conf["crt_list"]
+    data = ("# Managed by haproxy-admin. First entry = default certificate.\n" + "\n".join(paths) + "\n").encode()
+    with lock("config"):
+        old = None
+        if os.path.exists(target):
+            with open(target, "rb") as f:
+                old = f.read()
+        write_atomic(target, data, mode=0o600, like=target if old is not None else None)
+        with open(conf["cfg"], encoding="utf-8", errors="replace") as f:
+            referenced = target in f.read()
+        if not referenced:
+            log(f"crt-list written (not referenced yet): {paths}")
+            out_json({"ok": True, "output": f"{target} written. Not referenced by haproxy.cfg yet, no reload."})
+        rc, vout = validate_bytes(None, cfg_path=conf["cfg"])
+        ok, rout = (False, "") if rc else reload_haproxy()
+        if rc or not ok:
+            if old is None:
+                os.unlink(target)
+            else:
+                write_atomic(target, old, like=target)
+            if rc == 0:
+                reload_haproxy()
+            out_json({"ok": False, "output": (vout + "\n" + rout).strip() + "\nPrevious crt-list restored."}, 1)
+        log(f"crt-list written and reloaded: {paths}")
+        out_json({"ok": True, "output": "HAProxy reloaded."})
+
+
+
+
+# ----------------------------------------------------------------------------- block list
+def ensure_blocklist(conf):
+    path = conf["blocklist"]
+    if not os.path.exists(path):
+        write_atomic(path, b"# Managed by haproxy-admin: blocked client addresses/networks, one per line.\n", mode=0o644)
+
+
+def read_blocklist(conf):
+    try:
+        with open(conf["blocklist"], encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+    except OSError:
+        return []
+
+
+def cmd_blocklist(args, conf):
+    import ipaddress
+    values = []
+    for v in args.values:
+        try:
+            net = ipaddress.ip_network(v, strict=False)
+        except ValueError:
+            die(f"invalid address {v!r}")
+        values.append(str(net.network_address) if net.num_addresses == 1 else str(net))
+    with lock("config"):
+        ensure_blocklist(conf)
+        cur = read_blocklist(conf)
+        if args.action == "add":
+            new = cur + [v for v in values if v not in cur]
+        else:
+            new = [v for v in cur if v not in values]
+        header = "# Managed by haproxy-admin: blocked client addresses/networks, one per line.\n"
+        write_atomic(conf["blocklist"], (header + "".join(v + "\n" for v in new)).encode(), mode=0o644,
+                     like=conf["blocklist"])
+        msgs = []
+        try:
+            loaded = rt(conf, "show acl")
+            if conf["blocklist"] in loaded:
+                for v in values:
+                    r = rt(conf, f"{'add' if args.action == 'add' else 'del'} acl {conf['blocklist']} {v}").strip()
+                    if r and "Done" not in r and args.action == "add" and "already" not in r.lower():
+                        msgs.append(f"{v}: runtime update: {r}")
+                state = "active immediately"
+            else:
+                state = "saved; active once the configuration references the block list"
+        except OSError as e:
+            state = f"saved; runtime API not reachable ({e}), active after next reload"
+    log(f"blocklist {args.action} {values}")
+    word = "Blocked" if args.action == "add" else "Unblocked"
+    out_json({"ok": not msgs, "output": f"{word} {', '.join(values)} – {state}." + (" " + "; ".join(msgs) if msgs else "")})
+
+
+# ----------------------------------------------------------------------------- logs
+def _tail_matching(path, n, accept, max_bytes=64 * 1024 * 1024):
+    out = []
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return out
+    with f:
+        f.seek(0, os.SEEK_END)
+        pos = f.tell()
+        rest = b""
+        scanned = 0
+        while pos > 0 and len(out) < n and scanned < max_bytes:
+            size = min(1024 * 1024, pos)
+            pos -= size
+            f.seek(pos)
+            chunk = f.read(size) + rest
+            scanned += size
+            lines = chunk.split(b"\n")
+            rest = lines[0] if pos > 0 else b""
+            body = lines[1:] if pos > 0 else lines
+            for raw in reversed(body):
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "replace")
+                if accept(line):
+                    out.append(line)
+                    if len(out) >= n:
+                        break
+    return out
+
+
+def cmd_logs(args, conf):
+    n = args.lines
+    if not 1 <= n <= 5000:
+        die("invalid --lines")
+    for v in (args.grep, args.exclude):
+        if v and (len(v) > 200 or re.search(r"[\x00-\x1f]", v)):
+            die("invalid filter")
+    grep = (args.grep or "").lower()
+    excl = args.exclude or ""
+    status_re = re.compile(r"\] \S+ \S+/\S+ \S+ %s\d\d " % args.status) if args.status else None
+
+    def accept(line):
+        if grep and grep not in line.lower():
+            return False
+        if excl and excl in line:
+            return False
+        if status_re and not status_re.search(line):
+            return False
+        return True
+
+    if args.source == "service":
+        p = subprocess.run(["journalctl", "-u", "haproxy", "-n", str(min(n * 5, 20000)), "--no-pager", "-o", "short-iso"],
+                           capture_output=True, text=True, timeout=30)
+        lines = [l for l in p.stdout.splitlines() if accept(l)][-n:]
+        print("\n".join(lines))
+        return
+    found = _tail_matching(conf["log_file"], n, accept)
+    if len(found) < n:
+        found += _tail_matching(conf["log_file"] + ".1", n - len(found), accept)
+    print("\n".join(reversed(found)))
+
+# ----------------------------------------------------------------------------- main
+def main():
+    global ACTOR
+    if os.geteuid() != 0:
+        die("must run as root (via sudo)")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    syslog.openlog("haproxy-admin-helper", syslog.LOG_PID, syslog.LOG_AUTHPRIV)
+    os.umask(0o077)
+
+    ap = argparse.ArgumentParser(prog="haproxy-admin-helper")
+    ap.add_argument("--actor", default=os.environ.get("SUDO_USER", "unknown"))
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("validate")
+    p = sub.add_parser("apply")
+    p.add_argument("--expect-sha", required=True)
+    p.add_argument("--reason", default="")
+    sub.add_parser("history")
+    p = sub.add_parser("backup-show")
+    p.add_argument("id")
+    sub.add_parser("certs")
+    p = sub.add_parser("issue")
+    p.add_argument("--name", required=True)
+    p.add_argument("--method", choices=("dns", "http"), required=True)
+    p.add_argument("--key-type", choices=("rsa", "ecdsa"), default="rsa")
+    p.add_argument("--staging", action="store_true")
+    p.add_argument("-d", dest="domain", action="append", default=[])
+    p = sub.add_parser("renew")
+    p.add_argument("--name", required=True)
+    p.add_argument("--force", action="store_true")
+    p = sub.add_parser("delete")
+    p.add_argument("--name", required=True)
+    p = sub.add_parser("deploy")
+    p.add_argument("--name", required=True)
+    p = sub.add_parser("auto-deploy")
+    p.add_argument("--name", required=True)
+    sub.add_parser("dns-list")
+    sub.add_parser("dns-save")
+    p = sub.add_parser("dns-delete")
+    p.add_argument("--id", required=True)
+    sub.add_parser("dns-import-legacy")
+    p = sub.add_parser("dns-test")
+    p.add_argument("--id", required=True)
+    p.add_argument("--domain", default="")
+    sub.add_parser("dns-auth")
+    sub.add_parser("dns-cleanup")
+    p = sub.add_parser("dns-switch")
+    p.add_argument("--name", required=True)
+    sub.add_parser("deploy-hook")
+    p = sub.add_parser("blocklist")
+    p.add_argument("action", choices=("add", "del"))
+    p.add_argument("values", nargs="+")
+    p = sub.add_parser("logs")
+    p.add_argument("--source", choices=("traffic", "service"), default="traffic")
+    p.add_argument("--lines", type=int, default=300)
+    p.add_argument("--grep", default="")
+    p.add_argument("--exclude", default="")
+    p.add_argument("--status", choices=("4", "5"), default=None)
+    p = sub.add_parser("crtlist-write")
+    p.add_argument("names", nargs="+")
+    args = ap.parse_args()
+
+    if not ACTOR_RE.match(args.actor):
+        die("invalid actor")
+    ACTOR = args.actor
+    if args.cmd not in ("history", "certs", "backup-show", "validate", "logs", "dns-list"):
+        log(f"command={args.cmd}")
+
+    conf = load_conf()
+    handlers = {
+        "validate": cmd_validate, "apply": cmd_apply, "history": cmd_history,
+        "backup-show": cmd_backup_show, "certs": cmd_certs, "issue": cmd_issue,
+        "renew": cmd_renew, "delete": cmd_delete, "deploy": cmd_deploy, "auto-deploy": cmd_auto_deploy,
+        "deploy-hook": cmd_deploy_hook, "crtlist-write": cmd_crtlist_write,
+        "blocklist": cmd_blocklist, "logs": cmd_logs,
+        "dns-list": cmd_dns_list, "dns-save": cmd_dns_save, "dns-delete": cmd_dns_delete,
+        "dns-import-legacy": cmd_dns_import_legacy, "dns-test": cmd_dns_test, "dns-auth": cmd_dns_auth,
+        "dns-cleanup": cmd_dns_cleanup, "dns-switch": cmd_dns_switch,
+    }
+    handlers[args.cmd](args, conf)
+
+
+if __name__ == "__main__":
+    main()

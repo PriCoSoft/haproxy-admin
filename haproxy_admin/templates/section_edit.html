@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Edit {{ sec.title }}{% endblock %}
+{% block content %}
+<h1>Edit <span class="mono">{{ sec.title }}</span></h1>
+<form method="post" action="{{ url_for('main.config_preview') }}" class="card">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <input type="hidden" name="base_sha" value="{{ sha }}">
+  <input type="hidden" name="section" value="{{ idx }}">
+  <textarea name="content" class="editor" rows="{{ [sec.lines|length + 4, 50]|min }}" spellcheck="false">{{ sec.text }}</textarea>
+  <div class="row">
+    <button class="btn primary">Validate &amp; preview</button>
+    <a class="btn" href="{{ url_for('main.config') }}">Cancel</a>
+  </div>
+</form>
+{% endblock %}

@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>Logs</h1><p class="sub">Newest first. {{ 'HAProxy traffic log' if source == 'traffic' else 'HAProxy service journal (start, reload, errors)' }}.</p></div>
+  <div class="row">
+    <a class="btn {{ 'primary' if source == 'traffic' }}" href="{{ url_for('main.logs', source='traffic') }}">Traffic</a>
+    <a class="btn {{ 'primary' if source == 'service' }}" href="{{ url_for('main.logs', source='service') }}">Service</a>
+  </div>
+</div>
+
+<form method="get" class="card logfilter" id="logform" {% if auto %}data-autorefresh="5"{% endif %}>
+  <input type="hidden" name="source" value="{{ source }}">
+  <label>Search <span class="hint">IP, host name, path, site, status…</span><input name="q" value="{{ q }}" class="mono" placeholder="e.g. 203.0.113.7 or COM-EXAMPLE-MAIL"></label>
+  {% if source == 'traffic' %}
+  <label>Status <select name="status"><option value="">all</option><option value="4" {{ 'selected' if status == '4' }}>4xx</option><option value="5" {{ 'selected' if status == '5' }}>5xx</option></select></label>
+  {% endif %}
+  <label>Lines <select name="lines">{% for n in (100, 300, 1000, 5000) %}<option {{ 'selected' if lines == n }}>{{ n }}</option>{% endfor %}</select></label>
+  <div class="checks">
+    {% if source == 'traffic' %}<label class="chk"><input type="checkbox" name="tcp" value="1" {{ 'checked' if show_tcp }}>TLS connections</label>{% endif %}
+    <label class="chk"><input type="checkbox" name="auto" value="1" {{ 'checked' if auto }}>Auto refresh</label>
+  </div>
+  <button class="btn primary">Show</button>
+</form>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<section class="card">
+  {% if source == 'traffic' %}
+  <table class="logtable">
+    <tr><th>Time</th><th>Client</th><th>Host / request</th><th>Site / server</th><th class="num">Status</th><th class="num">ms</th><th class="num">Bytes</th><th>End</th></tr>
+    {% for r in rows %}
+    {% if r.kind == 'http' %}
+    <tr>
+      <td class="small nowrap">{{ r.time }}</td>
+      <td class="mono small"><a href="{{ url_for('main.logs', source='traffic', q=r.client) }}">{{ r.client }}</a></td>
+      <td class="small reqcell"><strong>{{ r.host }}</strong> <span class="mono">{{ r.method }} {{ r.path }}</span></td>
+      <td class="small">{{ r.be }}<span class="muted">/{{ r.srv }}</span><div class="muted">{{ r.fe }}</div></td>
+      <td class="num"><span class="badge {{ r.cls }}">{{ r.status }}</span></td>
+      <td class="num small">{{ r.total }}</td>
+      <td class="num small">{{ r.bytes }}</td>
+      <td class="mono small" title="{{ r.term_hint }}">{{ r.term }}</td>
+    </tr>
+    {% elif r.kind == 'tcp' %}
+    <tr class="tcp">
+      <td class="small nowrap">{{ r.time }}</td>
+      <td class="mono small"><a href="{{ url_for('main.logs', source='traffic', q=r.client, tcp=1) }}">{{ r.client }}</a></td>
+      <td class="small muted">TLS connection</td>
+      <td class="small">{{ r.be }}<span class="muted">/{{ r.srv }}</span><div class="muted">{{ r.fe }}</div></td>
+      <td></td><td class="num small">{{ r.total }}</td><td class="num small">{{ r.bytes }}</td>
+      <td class="mono small" title="{{ r.term_hint }}">{{ r.term }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="mono small">{{ r.raw }}</td></tr>
+    {% endif %}
+    {% else %}
+    <tr><td colspan="8" class="muted">No matching log lines.</td></tr>
+    {% endfor %}
+  </table>
+  <p class="hint">End codes: first letter = who ended the session (C client, S server, P proxy – e.g. deny or silent-drop, R resource limit, - normal), second = phase. Hover for details.</p>
+  {% else %}
+  <pre class="code log">{% for r in rows %}{{ r.raw }}
+{% else %}No entries.{% endfor %}</pre>
+  {% endif %}
+</section>
+{% endblock %}

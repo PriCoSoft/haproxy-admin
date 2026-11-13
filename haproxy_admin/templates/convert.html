@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Import manual changes' if managed else 'Convert configuration' }}{% endblock %}
+{% block content %}
+<div class="pagehead">
+  <div><h1>{{ 'Import manual changes' if managed else 'Convert to managed configuration' }}</h1>
+    <p class="sub">{% if managed %}haproxy.cfg was edited by hand after the last change from this tool.{% else %}HAProxy Admin generates the complete haproxy.cfg from its model. The current hand-written file is imported once.{% endif %}</p></div>
+</div>
+
+<section class="card">
+  <h2>What happens</h2>
+  <ul class="list">
+    <li><span class="dot good"></span><div>Sites, host rules incl. path conditions, servers, path filters, redirects, rate limits, headers and blocked TLS names become editable in the forms.</div></li>
+    <li><span class="dot good"></span><div>The file is regenerated in a uniform layout; comments and commented-out lines are not carried over (the current file stays in History and can be restored).</div></li>
+    <li><span class="dot good"></span><div>New: a block list (<code>tcp-request connection reject</code> on port 80/443, empty at first) and an always-defined <code>trusted</code> network list.</div></li>
+    {% for n in report.notes %}<li><span class="dot warn"></span><div>{{ n }}</div></li>{% endfor %}
+  </ul>
+  {% if report.unmapped %}
+  <h3 class="sub">Not understood – kept as extra lines</h3>
+  <pre class="code small">{{ report.unmapped|join('\n') }}</pre>
+  {% endif %}
+  {% for e in errors %}<div class="flash error">{{ e }}</div>{% endfor %}
+</section>
+
+<section class="card">
+  <h2>Difference to the current file</h2>
+  {% if diff %}<pre class="diff">{% for kind, line in diff %}<span class="{{ kind }}">{{ line }}</span>
+{% endfor %}</pre>{% else %}<p class="muted">No differences.</p>{% endif %}
+</section>
+
+<form method="post" class="actionbar">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <input type="hidden" name="base_sha" value="{{ st.sha }}">
+  <button class="btn primary" name="action" value="import" {{ 'disabled' if errors }}>{{ 'Import into model' if managed else 'Continue to preview' }}</button>
+  {% if managed %}<button class="btn danger-outline" name="action" value="regenerate" data-confirm-click="Discard the manual edits and regenerate the file from the model?">Discard manual edits</button>{% endif %}
+  <span class="hint">Next step is the usual validation &amp; preview; nothing is applied before you confirm.</span>
+</form>
+{% endblock %}

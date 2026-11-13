@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Sign in{% endblock %}
+{% block content %}
+<div class="login card">
+  <img class="loginlogo" src="{{ url_for('static', filename='icon.svg') }}" alt="">
+  <h1>HAProxy Admin</h1>
+  <p class="muted">{{ server_name }}</p>
+  {% if error %}<div class="flash info">{{ error }}</div>{% endif %}
+  <a class="btn primary wide" href="{{ url_for('auth.start', next=next) }}">Sign in with Microsoft</a>
+  <p class="muted small">Access is restricted to administrators assigned in Microsoft Entra ID.</p>
+</div>
+{% endblock %}

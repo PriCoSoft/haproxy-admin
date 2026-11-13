@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}DNS providers{% endblock %}
+{% macro typemark(t) -%}
+{% set m = types.get(t, {}) %}<span class="pmark pm-{{ m.tone or 'accent' }}" aria-hidden="true">{{ m.mark or (m.label or '?')[:2] }}</span>
+{%- endmacro %}
+{% block content %}
+<div class="pagehead">
+  <div><a class="back" href="{{ url_for('main.certs') }}">‹ Certificates</a><h1>DNS providers</h1>
+    <p class="sub">Accounts used to publish the <code>_acme-challenge</code> TXT token for DNS-01 validation (wildcards, own domains).</p></div>
+</div>
+{% if err %}<div class="flash error">Helper: {{ err }}</div>{% endif %}
+
+{% if data %}
+{% if not data.builtin %}
+<div class="flash error">New DNS-01 certificates still use the external hook <code>{{ data.legacy.path }}</code>
+  (admin.conf <code>[certs] dns_hook</code>). Set <code>dns_hook = builtin</code> to use the providers below.</div>
+{% endif %}
+{% if data.legacy.importable %}
+<section class="card callout">
+  <div>
+    <h2>Existing hook script found</h2>
+    <p class="hint"><code>{{ data.legacy.path }}</code> contains the DNS update settings used so far. Import them as a
+      <strong>{{ data.legacy.label }}</strong> provider – the credentials are copied on the server and are never shown in the browser.</p>
+  </div>
+  <form method="post" action="{{ url_for('main.cert_dns_import') }}">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}"><button class="btn primary">Import</button></form>
+</section>
+{% endif %}
+
+<div class="certgrid">
+  {% for p in providers %}
+  {% set t = types[p.type] %}
+  <div class="certcard {{ 'staging' if not p.enabled }}" id="p-{{ p.id }}">
+    <div class="ch">
+      <div class="ptitle">{{ typemark(p.type) }}
+        <div><h3>{{ p.name }}</h3>
+          <div class="tags">
+            <span class="badge">{{ t.label }}</span>
+            {% if not p.enabled %}<span class="badge warn">disabled</span>{% endif %}
+            {% if t.cleanup %}<span class="badge" title="TXT records are deleted after validation">auto cleanup</span>{% endif %}
+          </div>
+        </div>
+      </div>
+      {% if p.last_test %}
+        <span class="badge {{ 'good' if p.last_test.ok else 'bad' }}" title="{{ p.last_test.time|ts }} · {{ p.last_test.actor }}{{ ' · write test ' ~ p.last_test.domain if p.last_test.domain }}">test {{ 'OK' if p.last_test.ok else 'failed' }}</span>
+      {% else %}<span class="badge warn">not tested</span>{% endif %}
+    </div>
+    <div class="domains">{% for d in p.domains %}<span class="host">{{ d }} <em>+ sub</em></span>{% endfor %}</div>
+    <dl>
+      {% for f in t.fields %}
+      <dt>{{ f.label }}</dt>
+      <dd class="{{ 'mono small' if not f.secret }}">{% if f.secret %}{% if f.key in p.secrets_set %}<span class="badge good">stored</span>{% else %}<span class="badge bad">missing</span>{% endif %}{% else %}{{ p.settings[f.key] }}{% endif %}</dd>
+      {% endfor %}
+      {% if p.last_test %}<dt>Last test</dt><dd>{{ p.last_test.time|ts }}</dd>{% endif %}
+    </dl>
+    <div class="cardactions">
+      <form method="post" action="{{ url_for('main.cert_dns_test', pid=p.id) }}" class="testform">
+        <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+        <select name="domain" title="Check only, or also create and remove a temporary TXT value">
+          <option value="">Check access + delegation</option>
+          {% for d in p.domains %}<option value="{{ d }}">+ write test {{ d }}</option>{% endfor %}
+        </select>
+        <button class="btn small primary">Test</button>
+      </form>
+      <a class="btn small" href="{{ url_for('main.cert_dns_edit', pid=p.id) }}">Edit</a>
+      <details class="more"><summary class="btn small">…</summary>
+        <div class="menu">
+          <form method="post" action="{{ url_for('main.cert_dns_delete', pid=p.id) }}" data-confirm="Delete provider {{ p.name }}? Certificates of its domains can then not be renewed via DNS-01.">
+            <input type="hidden" name="_csrf" value="{{ csrf_token() }}"><button class="btn small danger">Delete</button></form>
+        </div>
+      </details>
+    </div>
+  </div>
+  {% else %}
+  <p class="muted">No DNS provider configured yet.</p>
+  {% endfor %}
+</div>
+
+<section class="card">
+  <h2>Add provider</h2>
+  <div class="ptypes">
+    {% for key, t in types.items() %}
+    <a class="ptype" href="{{ url_for('main.cert_dns_new', type=key) }}">
+      {{ typemark(key) }}
+      <span><strong>{{ t.label }}</strong><small>{{ t.summary }}</small></span>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+
+<section class="card">
+  <h2>Domains</h2>
+  <p class="hint">Which provider publishes the token for a name. A provider domain also covers all its subdomains; the most specific entry wins.</p>
+  <table>
+    <tr><th>Domain</th><th>Provider</th><th>Certificates</th></tr>
+    {% for r in rows %}
+    <tr><td class="mono small">{{ r.domain }}</td>
+      <td>{% if r.provider %}{{ typemark(r.provider.type) }} {{ r.provider.name }}{% else %}<span class="badge bad">none</span>{% endif %}</td>
+      <td class="small">{{ r.certs|join(', ') or '–' }}{% if r.hook == 'legacy' %} <span class="badge warn">external hook</span>{% endif %}</td></tr>
+    {% else %}<tr><td colspan="3" class="muted">No DNS-01 certificates and no provider domains.</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<details class="card">
+  <summary><h2 class="inline">How it works</h2></summary>
+  <ol class="small howto">
+    <li>certbot calls the built-in hook for each name. The hook picks the provider by domain.</li>
+    <li>If <code>_acme-challenge.&lt;domain&gt;</code> is a CNAME (delegation), the TXT value is written at the CNAME target.</li>
+    <li>The hook waits until all authoritative name servers serve the value, then – after the last name – one TTL, so
+      no resolver still holds an older copy. This avoids the "Incorrect TXT record" failures of back-to-back requests.</li>
+    <li>After validation the value is removed again (for providers whose API can delete records – see "auto cleanup").</li>
+  </ol>
+  <p class="hint">Credentials are stored in <code>/etc/haproxy-admin/dns-providers.json</code> (root only) and never sent back to the browser.</p>
+</details>
+{% endif %}
+{% endblock %}
