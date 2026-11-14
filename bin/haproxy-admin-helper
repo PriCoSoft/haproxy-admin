@@ -681,7 +681,8 @@ def cmd_crtlist_write(args, conf):
         if os.path.exists(target):
             with open(target, "rb") as f:
                 old = f.read()
-        write_atomic(target, data, mode=0o600, like=target if old is not None else None)
+        # Only file paths, no secrets: world-readable so the web app can count entries.
+        write_atomic(target, data, mode=0o644)
         with open(conf["cfg"], encoding="utf-8", errors="replace") as f:
             referenced = target in f.read()
         if not referenced:

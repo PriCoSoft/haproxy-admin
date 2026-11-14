@@ -3,6 +3,7 @@ import difflib
 import hashlib
 import json
 import re
+import os
 import secrets
 import threading
 import time
@@ -60,9 +61,20 @@ def crt_list_entries():
         return []
 
 
+def crt_list_count():
+    """Entries in the crt-list. An existing but unreadable file (e.g. root-only, written by an older
+    helper) counts as non-empty: dropping the HTTPS frontends because of a permission problem would be
+    far worse than an empty list, which `haproxy -c` rejects anyway."""
+    path = S().crt_list
+    n = len(crt_list_entries())
+    if n == 0 and os.path.exists(path) and not os.access(path, os.R_OK):
+        return 1
+    return n
+
+
 def gen_ctx():
     s = S()
-    return {"crt_list": s.crt_list, "crt_list_count": len(crt_list_entries()), "acme_port": s.http01_port,
+    return {"crt_list": s.crt_list, "crt_list_count": crt_list_count(), "acme_port": s.http01_port,
             "denylist": s.denylist}
 
 

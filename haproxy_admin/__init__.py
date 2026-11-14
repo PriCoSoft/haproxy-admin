@@ -7,7 +7,7 @@ from flask import Flask
 
 from .settings import Settings
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def _bind_is_loopback(bind):

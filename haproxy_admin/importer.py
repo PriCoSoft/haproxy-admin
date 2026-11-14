@@ -397,7 +397,7 @@ def import_config(text, ctx):
                     continue
             mm = re.match(r"http-request redirect code (\d+) location (\S+) if (.*)$", s)
             if mm:
-                cond = mm.group(3).replace(ACME_COND, " ").replace("!" + ACME_COND.strip(), " ")
+                cond = mm.group(3).replace("!" + ACME_COND, " ").replace(ACME_COND, " ")
                 cond = re.sub(r"!\s*\{ path_beg /\.well-known/acme-challenge/ \}", " ", cond)
                 terms = parse_terms(cond, acls)
                 rt = split_route(terms) if terms is not None else None
