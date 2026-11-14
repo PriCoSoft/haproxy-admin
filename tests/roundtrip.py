@@ -14,7 +14,7 @@ src, outdir = sys.argv[1], sys.argv[2]
 os.makedirs(outdir, exist_ok=True)
 deny = os.path.join(outdir, "denylist.acl")
 open(deny, "a").close()
-ctx = {"crt_list": "/etc/haproxy/crt-list.txt", "crt_list_count": 0, "acme_port": 8402, "denylist": deny}
+ctx = {"crt_list": "/etc/haproxy/crt-list.txt", "crt_list_count": 1, "acme_port": 8402, "denylist": deny}
 text = open(src, encoding="utf-8").read()
 m, rep = importer.import_config(text, ctx)
 print("NOTES:", *rep["notes"], sep="\n  ")
